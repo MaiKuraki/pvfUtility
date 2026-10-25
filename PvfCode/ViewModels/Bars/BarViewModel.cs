@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -485,6 +485,15 @@ public class BarViewModel : ViewModelBase
 			openStopwatch.Restart();
 			await Task.Run((Func<Task?>)AppCore.ViewModelBase.ImagePacks2ViewModel.LoadImagePacks2);
 			imagePacksMs = openStopwatch.ElapsedMilliseconds;
+		}
+		else if (ImagePack2Service.Instance.Count > 0)
+		{
+			// 图片索引已经在内存里：直接对当前 PVF 做一次缺失检查。
+			// 放到后台跑，不阻塞开包流程（36 万文件扫描通常 1~3 秒）。
+			_ = Task.Run(delegate
+			{
+				AppCore.ViewModelBase.ImagePacks2ViewModel.RunMissingResourceCheck();
+			});
 		}
 		AppCore.Logger.Warning($"[开包耗时] 读包/解密 {readPackageMs} ms，建文件树 {buildTreeMs} ms，开包备份 {backupMs} ms，图片索引 {imagePacksMs} ms，合计 {readPackageMs + buildTreeMs + backupMs + imagePacksMs} ms");
 		AppCore.ClearMemory();

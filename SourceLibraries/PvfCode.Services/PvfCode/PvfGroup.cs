@@ -7,6 +7,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using DevExpress.Mvvm;
@@ -392,6 +393,60 @@ public class PvfGroup : PvfPack
 		{
 			// 探测失败不能影响开包
 		}
+	}
+
+	/// <summary>
+	/// 扫描全包，收集所有"看起来像资源路径"的字符串值，用于检查 ImagePacks2 是否缺失。
+	///
+	/// 并行执行，每个线程用自己的本地集合，结束后合并——直接并行 Add 一个共享 HashSet
+	/// 会在 36 万文件规模下变成锁竞争灾难。
+	/// </summary>
+	public HashSet<string> CollectAllResourceReferences(IProgress<double> progress = null, CancellationToken cancellationToken = default)
+	{
+		HashSet<string> sink = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		if (base.FileList == null || base.FileList.Count == 0)
+		{
+			return sink;
+		}
+		PvfFile[] files = new PvfFile[base.FileList.Count];
+		base.FileList.Values.CopyTo(files, 0);
+		object syncRoot = new object();
+		int processed = 0;
+		ParallelOptions options = new ParallelOptions
+		{
+			CancellationToken = cancellationToken
+		};
+		try
+		{
+			Parallel.ForEach(files, options, delegate()
+			{
+				return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+			}, delegate(PvfFile file, ParallelLoopState state, HashSet<string> local)
+			{
+				file.CollectReferencedPaths(this, local);
+				int done = Interlocked.Increment(ref processed);
+				// 每 8192 个文件报一次进度，避免进度回调本身成为开销
+				if (progress != null && (done & 0x1FFF) == 0)
+				{
+					progress.Report(done * 100.0 / files.Length);
+				}
+				return local;
+			}, delegate(HashSet<string> local)
+			{
+				lock (syncRoot)
+				{
+					foreach (string item in local)
+					{
+						sink.Add(item);
+					}
+				}
+			});
+		}
+		catch (OperationCanceledException)
+		{
+		}
+		progress?.Report(100.0);
+		return sink;
 	}
 
 	/// <summary>

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -220,7 +220,14 @@ public static class NpkCoder
 		return ReadNpk(stream);
 	}
 
-	public static async Task<ResultData<Dictionary<string, UtImgFile>, string, Dictionary<int, string>>> ParallelReadNpkList2(string dirName)
+	/// <summary>
+	/// 扫描目录下所有 NPK 的图片索引。
+	/// </summary>
+	/// <param name="duplicateTracker">
+	/// 可选。传入后会记录"同一图片路径被多个 NPK 提供"的情况：
+	/// 键为图片路径，值为涉及的 NPK 文件 id（同一个 id 可能重复出现，调用方自行去重）。
+	/// </param>
+	public static async Task<ResultData<Dictionary<string, UtImgFile>, string, Dictionary<int, string>>> ParallelReadNpkList2(string dirName, ConcurrentDictionary<string, ConcurrentBag<NpkImageSourceInfo>> duplicateTracker = null)
 	{
 		_fileNameIdCounter = 1;
 		StringBuilder buiError = new StringBuilder();
@@ -237,7 +244,7 @@ public static class NpkCoder
 			};
 			Parallel.ForEach(list, parallelOptions, delegate(string item)
 			{
-				ReadNpkInfo2(item, concurrentDictionary, buiError, concurrentDictionary2);
+				ReadNpkInfo2(item, concurrentDictionary, buiError, concurrentDictionary2, duplicateTracker);
 			});
 		});
 		return new ResultData<Dictionary<string, UtImgFile>, string, Dictionary<int, string>>
@@ -246,6 +253,23 @@ public static class NpkCoder
 			Data2 = buiError.ToString(),
 			Data3 = concurrentDictionary2.ToDictionary((KeyValuePair<int, string> it) => it.Key, (KeyValuePair<int, string> it) => it.Value)
 		};
+	}
+
+	/// <summary>
+	/// 记录"同一图片路径被多个 NPK 提供"。同一个 id 可能被重复添加，调用方聚合时去重。
+	/// </summary>
+	private static void RecordDuplicateImage(ConcurrentDictionary<string, ConcurrentBag<NpkImageSourceInfo>> tracker, string name, int incomingNpkId, int incomingLength, UtImgFileTemp existing)
+	{
+		if (tracker == null || existing == null || existing.FileNameId == incomingNpkId)
+		{
+			return;
+		}
+		ConcurrentBag<NpkImageSourceInfo> bag = tracker.GetOrAdd(name, static delegate(string key)
+		{
+			return new ConcurrentBag<NpkImageSourceInfo>();
+		});
+		bag.Add(new NpkImageSourceInfo(incomingNpkId, incomingLength, 0));
+		bag.Add(new NpkImageSourceInfo(existing.FileNameId, existing.Length, existing.Count));
 	}
 
 	/// <summary>
@@ -305,7 +329,7 @@ public static class NpkCoder
 		return GbkEncoding.GetString(buffer.Slice(0, length));
 	}
 
-	private static void ReadNpkInfo2(string filePath, ConcurrentDictionary<string, UtImgFileTemp> dic, StringBuilder buiError, ConcurrentDictionary<int, string> npkFilePathDic)
+	private static void ReadNpkInfo2(string filePath, ConcurrentDictionary<string, UtImgFileTemp> dic, StringBuilder buiError, ConcurrentDictionary<int, string> npkFilePathDic, ConcurrentDictionary<string, ConcurrentBag<NpkImageSourceInfo>> duplicateTracker = null)
 	{
 		if (!File.Exists(filePath))
 		{
@@ -319,7 +343,7 @@ public static class NpkCoder
 			// 索引区一次读一条 264 字节记录，替代原来"ReadInt + Seek + ReadPath(256 次 ReadByte)"
 			byte[] record = new byte[NpkIndexRecordSize];
 			int entryCount;
-			(int offset, string name)[] entries;
+			(int offset, int length, string name)[] entries;
 			using (FileStream fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan))
 			{
 				Span<byte> head = stackalloc byte[20];
@@ -337,17 +361,19 @@ public static class NpkCoder
 				{
 					return;
 				}
-				entries = new (int, string)[entryCount];
+				entries = new (int offset, int length, string name)[entryCount];
 				for (int i = 0; i < entryCount; i++)
 				{
 					if (fileStream.ReadAtLeast(record, NpkIndexRecordSize, throwOnEndOfStream: false) < NpkIndexRecordSize)
 					{
-						entries[i] = (-1, null);
+						entries[i] = (-1, 0, null);
 						continue;
 					}
 					int offset = BinaryPrimitives.ReadInt32LittleEndian(record.AsSpan(0, 4));
+					// 索引记录里 offset 之后就是字节长度，用来判断同名资源内容是否一致
+					int length = BinaryPrimitives.ReadInt32LittleEndian(record.AsSpan(4, 4));
 					string name = DecodeNpkName(record.AsSpan(NpkIndexNameOffset, NpkIndexNameLength));
-					entries[i] = (offset, name);
+					entries[i] = (offset, length, name);
 				}
 			}
 			// 第二遍只需要每张图的签名和帧数：一次读 40 字节，替代原来两次 Seek + 两轮逐字节读取
@@ -356,6 +382,7 @@ public static class NpkCoder
 			for (int j = 0; j < entries.Length; j++)
 			{
 				int offset = entries[j].offset;
+				int entryLength = entries[j].length;
 				string name = entries[j].name;
 				if (offset <= 0 || name == null)
 				{
@@ -388,11 +415,19 @@ public static class NpkCoder
 				int count = BinaryPrimitives.ReadInt32LittleEndian(imageHeader.AsSpan(countOffset, 4));
 				if (!dic.TryGetValue(name, out UtImgFileTemp entry))
 				{
-					entry = new UtImgFileTemp(offset, fileNameId);
+					entry = new UtImgFileTemp(offset, entries[j].length, fileNameId);
 					if (!dic.TryAdd(name, entry))
 					{
+						// 并发窗口：另一个线程刚插入了同一路径
 						dic.TryGetValue(name, out entry);
+						RecordDuplicateImage(duplicateTracker, name, fileNameId, entryLength, entry);
 					}
+				}
+				else
+				{
+					// 路径已存在：这是"同一资源被多个 NPK 提供"的常见路径。
+					// 原实现直接复用已有条目，重复信息在这里就丢了。
+					RecordDuplicateImage(duplicateTracker, name, fileNameId, entryLength, entry);
 				}
 				if (entry != null)
 				{

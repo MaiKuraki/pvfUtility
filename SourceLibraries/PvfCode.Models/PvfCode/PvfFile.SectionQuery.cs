@@ -40,6 +40,78 @@ public partial class PvfFile
 		return false;
 	}
 
+	/// <summary>
+	/// 收集脚本里"看起来像资源路径"的字符串值，供 ImagePacks2 缺失检查使用。
+	///
+	/// 只处理 type=7（直接字符串）的节值：type=9 是指向另一处字符串的指针，链路更长，
+	/// 先把覆盖面最广的一类做准，再考虑扩展。
+	/// </summary>
+	/// <returns>本次新增到集合的路径数量。</returns>
+	public int CollectReferencedPaths(PvfPack pvf, ISet<string> sink)
+	{
+		if (Data == null || pvf?.Strtable == null || sink == null || DataLen < 7)
+		{
+			return 0;
+		}
+		ReadOnlySpan<int> offsets = SectionOffsets;
+		int limit = DataLen - 9;
+		int added = 0;
+		for (int k = 0; k < offsets.Length; k++)
+		{
+			int offset = offsets[k];
+			if (offset >= limit)
+			{
+				break;
+			}
+			if (Data[offset] != 5 || Data[offset + 5] != 7)
+			{
+				continue;
+			}
+			if (offset + 11 > DataLen)
+			{
+				continue;
+			}
+			int stringId = BinaryPrimitives.ReadInt32LittleEndian(Data.AsSpan(offset + 6, 4));
+			string value = pvf.Strtable.GetStringItem(stringId);
+			if (value == null || !LooksLikeResourcePath(value))
+			{
+				continue;
+			}
+			if (sink.Add(value))
+			{
+				added++;
+			}
+		}
+		return added;
+	}
+
+	/// <summary>
+	/// 判断一个字符串值是否是 ImagePacks2 里的图片资源引用。
+	///
+	/// 只认 .img：实测 PVF 里大量以 .ani 结尾的值是"动画名"（PVF 内部定义，如
+	/// "%s/Attack1.ani"），.ogg 在 SoundPacks 目录，.pvf 是包文件，
+	/// 它们都不在 ImagePacks2 里——把它们算成资源引用会产生上万条假缺失。
+	/// </summary>
+	private static bool LooksLikeResourcePath(string value)
+	{
+		int length = value.Length;
+		if (length < 6 || length > 260)
+		{
+			return false;
+		}
+		if (!value.EndsWith(".img", StringComparison.OrdinalIgnoreCase))
+		{
+			return false;
+		}
+		// 含格式化占位符的是模板，不是真实路径：
+		// 例如 "fm_body%04d.img"（按帧号替换）、"%s/Attack1.ani"
+		if (value.IndexOf('%') >= 0)
+		{
+			return false;
+		}
+		return true;
+	}
+
 	public bool GetSectionValue(string sectionName, PvfPack pvf, out string? val)
 	{
 		int stringTableId = pvf.Strtable.GetStringTableId(sectionName);

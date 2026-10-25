@@ -59,6 +59,9 @@ public class ImagePack2Service : ViewModelBase
 
 	public IDictionary<string, UtImgFile> NpkImgDIC { get; private set; }
 
+	/// <summary>最近一次加载 ImagePacks2 得到的资源冲突报告（同一路径多源、NPK 间重叠）。</summary>
+	public ResourceConflictReport LastConflictReport { get; private set; } = ResourceConflictReport.Empty;
+
 	public Dictionary<int, string> NpkFilePathDic { get; set; }
 
 	[JsonIgnore]
@@ -371,7 +374,9 @@ public class ImagePack2Service : ViewModelBase
 		RaisePropertyChanged("Count");
 		Stopwatch sw = new Stopwatch();
 		sw.Start();
-		ResultData<Dictionary<string, UtImgFile>, string, Dictionary<int, string>> resultData = await NpkCoder.ParallelReadNpkList2(dir);
+		// 记录"同一图片路径被多个 NPK 提供"的情况，加载完再聚合成冲突报告
+		ConcurrentDictionary<string, ConcurrentBag<NpkImageSourceInfo>> duplicateTracker = new ConcurrentDictionary<string, ConcurrentBag<NpkImageSourceInfo>>();
+		ResultData<Dictionary<string, UtImgFile>, string, Dictionary<int, string>> resultData = await NpkCoder.ParallelReadNpkList2(dir, duplicateTracker);
 		sw.Stop();
 		_ = sw.Elapsed;
 		if (resultData.IsError)
@@ -389,7 +394,138 @@ public class ImagePack2Service : ViewModelBase
 		NpkFilePathDic = resultData.Data3;
 		RaisePropertyChanged("Count");
 		AppSetting.Instance.GetIlogger()?.Success(string.Format(AppSetting.Instance.GetIlogger()?.GetStr("mess_ImagePacks2ModelDirLoadSuccess"), Count));
+		BuildResourceConflictReport(duplicateTracker, resultData.Data3, NpkImgDIC, dir);
 		return re;
+	}
+
+	/// <summary>
+	/// 比对 PVF 引用的资源与当前 ImagePacks2 的实际内容，找出缺失项。
+	///
+	/// 只读操作：扫描 PVF 全部文件提取引用，再到图片索引里查。36 万文件的扫描在
+	/// 调用方线程上并行完成，耗时通常在 1~3 秒，调用方应放在后台执行。
+	/// </summary>
+	public MissingResourceReport CheckMissingResources(PvfGroup pvf, IProgress<double> progress = null)
+	{
+		if (pvf == null || NpkImgDIC == null || NpkImgDIC.Count == 0)
+		{
+			return MissingResourceReport.Empty;
+		}
+		HashSet<string> references = pvf.CollectAllResourceReferences(progress);
+		List<MissingResourceEntry> missing = new List<MissingResourceEntry>();
+		int checkedCount = 0;
+		foreach (string raw in references)
+		{
+			string key = NormalizeReferencePath(raw);
+			if (key == null)
+			{
+				continue;
+			}
+			checkedCount++;
+			if (!NpkImgDIC.ContainsKey(key))
+			{
+				missing.Add(new MissingResourceEntry
+				{
+					RawPath = raw,
+					NormalizedPath = key
+				});
+			}
+		}
+		missing.Sort(delegate(MissingResourceEntry left, MissingResourceEntry right)
+		{
+			return string.CompareOrdinal(left.NormalizedPath, right.NormalizedPath);
+		});
+		return new MissingResourceReport
+		{
+			ReferenceCount = references.Count,
+			CheckedCount = checkedCount,
+			Missing = missing
+		};
+	}
+
+	/// <summary>
+	/// 把 PVF 里的资源写法归一化成 ImagePacks2 索引里的 key：反斜杠转正斜杠、转小写、
+	/// 缺前缀时补 sprite/（PVF 里常写相对路径，图片索引里是完整路径）。
+	/// </summary>
+	private static string NormalizeReferencePath(string value)
+	{
+		if (string.IsNullOrEmpty(value))
+		{
+			return null;
+		}
+		string normalized = value.Replace('\\', '/').Trim().ToLowerInvariant();
+		if (normalized.Length == 0)
+		{
+			return null;
+		}
+		// 声音资源在 SoundPacks 目录，不在 ImagePacks2 里，不参与本次比对
+		if (normalized.EndsWith(".ogg", StringComparison.Ordinal))
+		{
+			return null;
+		}
+		if (normalized.StartsWith("sprite/", StringComparison.Ordinal))
+		{
+			return normalized;
+		}
+		// ImagePacks2 索引里的图片路径统一以 sprite/ 开头（包括地图：sprite/map/...），
+		// 而 PVF 里常写成 Map/xxx、character/xxx 这种省略前缀的形式，一律补上。
+		return "sprite/" + normalized;
+	}
+
+	/// <summary>写出缺失检查报告（Markdown + JSON）。</summary>
+	public string WriteMissingReport(MissingResourceReport report, string pvfPath)
+	{
+		string directory = Path.Combine(AppSetting.AppBasePath, "资源检查");
+		Directory.CreateDirectory(directory);
+		string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+		string markdownPath = Path.Combine(directory, "缺失检查-" + stamp + ".md");
+		File.WriteAllText(markdownPath, report.BuildMarkdown(pvfPath, AppSetting.Instance.ImagePacks2Options.ImagePacks2Path));
+		string jsonPath = Path.Combine(directory, "缺失检查-" + stamp + ".json");
+		File.WriteAllText(jsonPath, report.BuildJson(pvfPath, AppSetting.Instance.ImagePacks2Options.ImagePacks2Path));
+		return markdownPath;
+	}
+
+	/// <summary>
+	/// 聚合资源冲突并输出报告。
+	/// 冲突不一定是错误——DNF 的客户端本身就存在同路径多包、包间重叠的情况，
+	/// 但改补丁时"改了不生效"往往就是这个原因，所以值得列出来。
+	/// </summary>
+	private void BuildResourceConflictReport(
+		ConcurrentDictionary<string, ConcurrentBag<NpkImageSourceInfo>> tracker,
+		Dictionary<int, string> npkNames,
+		IDictionary<string, UtImgFile> images,
+		string imagePacks2Path)
+	{
+		try
+		{
+			ResourceConflictReport report = ResourceConflictReport.Build(tracker, npkNames, images.Values);
+			LastConflictReport = report;
+			if (report.MultiSourceImages.Count == 0 && report.NpkOverlaps.Count == 0)
+			{
+				AppSetting.Instance.GetIlogger()?.Success("[资源检查] 未发现同一路径多源或 NPK 重叠");
+				return;
+			}
+			string reportPath = WriteConflictReport(report, imagePacks2Path);
+			AppSetting.Instance.GetIlogger()?.Warning(
+				$"[资源检查] 交集 {report.MultiSourceImages.Count} 条（内容不同 {report.DifferentContentCount} 条），涉及 {report.NpkOverlaps.Count} 组包对。报告：{reportPath}");
+		}
+		catch (Exception ex)
+		{
+			AppSetting.Instance.GetIlogger()?.Error("[资源检查] 生成报告失败：" + ex.Message);
+		}
+	}
+
+	private static string WriteConflictReport(ResourceConflictReport report, string imagePacks2Path)
+	{
+		// AppBasePath 本身已指向 exe 同级的 Options 目录，不要再拼一层
+		string directory = Path.Combine(AppSetting.AppBasePath, "资源检查");
+		Directory.CreateDirectory(directory);
+		string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+		string markdownPath = Path.Combine(directory, "冲突报告-" + stamp + ".md");
+		File.WriteAllText(markdownPath, report.BuildMarkdown(imagePacks2Path));
+		// 同一份数据同时输出 JSON，便于外部脚本做跨目录补齐等处理
+		string jsonPath = Path.Combine(directory, "冲突报告-" + stamp + ".json");
+		File.WriteAllText(jsonPath, report.BuildJson(imagePacks2Path));
+		return markdownPath;
 	}
 
 	public void LoadTreeIcons(PvfGroup pvf)
