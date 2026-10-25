@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Text;
 using PvfCode.Models.Pvf.Enums;
@@ -23,6 +23,9 @@ namespace PvfCode.Models.Pvf;
 public static class EncodingTypeDetector
 {
 	private const int MaxSamples = 120;
+
+	/// <summary>样例扫描范围：路径都在前面，中文条目可能在很后面，需要放宽。</summary>
+	private const int SampleScanLimit = 3000;
 	private const int MaxSampleBytes = 96;
 
 	/// <summary>探测结果。</summary>
@@ -71,10 +74,14 @@ public static class EncodingTypeDetector
 		return new Result { Suggested = onlyClean, Samples = samples, Structural = false };
 	}
 
-	/// <summary>用指定编码解出前几条字符串，供人工判断是否乱码。</summary>
+	/// <summary>
+	/// 用指定编码解出几条字符串，供人工判断是否乱码。
+	/// 优先挑"含非 ASCII 字符"的条目：stringtable 开头往往是文件路径（纯 ASCII），
+	/// 任何编码都能正确解码，拿它们当样例看不出问题。
+	/// </summary>
 	private static string[] BuildReadableSamples(byte[] bytes, EncodingType encodingType)
 	{
-		List<(int Start, int Length)> ranges = ExtractRanges(bytes);
+		List<(int Start, int Length)> ranges = ExtractRanges(bytes, SampleScanLimit);
 		if (ranges.Count == 0)
 		{
 			return Array.Empty<string>();
@@ -88,40 +95,59 @@ public static class EncodingTypeDetector
 		{
 			return Array.Empty<string>();
 		}
-		int take = Math.Min(3, ranges.Count);
-		string[] samples = new string[take];
-		int written = 0;
-		for (int i = 0; i < ranges.Count && written < take; i++)
+		List<string> withNonAscii = new List<string>(3);
+		List<string> fallback = new List<string>(3);
+		for (int i = 0; i < ranges.Count; i++)
 		{
+			string text;
 			try
 			{
-				string text = encoding.GetString(bytes, ranges[i].Start, ranges[i].Length).Replace("\0", string.Empty).Trim();
-				if (text.Length == 0)
-				{
-					continue;
-				}
-				if (text.Length > 24)
-				{
-					text = text.Substring(0, 24) + "…";
-				}
-				samples[written++] = text;
+				text = encoding.GetString(bytes, ranges[i].Start, ranges[i].Length).Replace("\0", string.Empty).Trim();
 			}
 			catch
 			{
+				continue;
+			}
+			if (text.Length == 0)
+			{
+				continue;
+			}
+			if (text.Length > 24)
+			{
+				text = text.Substring(0, 24) + "…";
+			}
+			bool hasNonAscii = false;
+			for (int k = 0; k < text.Length; k++)
+			{
+				if (text[k] >= '\u0080')
+				{
+					hasNonAscii = true;
+					break;
+				}
+			}
+			if (hasNonAscii)
+			{
+				withNonAscii.Add(text);
+				if (withNonAscii.Count >= 3)
+				{
+					break;
+				}
+			}
+			else if (fallback.Count < 3)
+			{
+				fallback.Add(text);
 			}
 		}
-		if (written == take)
+		if (withNonAscii.Count > 0)
 		{
-			return samples;
+			return withNonAscii.ToArray();
 		}
-		string[] trimmed = new string[written];
-		Array.Copy(samples, trimmed, written);
-		return trimmed;
+		return fallback.ToArray();
 	}
 
-	private static List<(int Start, int Length)> ExtractRanges(byte[] bytes)
+	private static List<(int Start, int Length)> ExtractRanges(byte[] bytes, int maxCount = MaxSamples)
 	{
-		List<(int, int)> ranges = new List<(int, int)>(MaxSamples);
+		List<(int, int)> ranges = new List<(int, int)>(Math.Min(maxCount, 256));
 		if (bytes == null || bytes.Length < 8)
 		{
 			return ranges;
@@ -131,7 +157,7 @@ public static class EncodingTypeDetector
 		{
 			return ranges;
 		}
-		int limit = Math.Min(count, MaxSamples);
+		int limit = Math.Min(count, maxCount);
 		for (int i = 0; i < limit; i++)
 		{
 			int indexOffset = i * 4 + 4;
