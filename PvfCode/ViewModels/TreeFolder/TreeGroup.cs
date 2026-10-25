@@ -228,57 +228,45 @@ public class TreeGroup : ModelBase
 
 	private Task BuildTrees(IEnumerable<string> fileList, PvfGroup pvf, ObservableConcurrentDictionaryEx<string, PvfTreeFileBase> source)
 	{
-		if (!fileList.Any())
+		// 原实现用 100 路并行 + 每个路径段 lock(this)：
+		// 36 万文件约 180 万次锁竞争，100 个线程等于在排队，纯亏上下文切换。
+		// 串行建树没有锁开销，实测更快也更稳。
+		StringBuilder pathBuilder = new StringBuilder(128);
+		foreach (string fullPath in fileList)
 		{
-			return Task.CompletedTask;
-		}
-		ParallelOptions parallelOptions = new ParallelOptions
-		{
-			MaxDegreeOfParallelism = 1
-		};
-		if (fileList.Count() >= 100)
-		{
-			parallelOptions.MaxDegreeOfParallelism = 100;
-		}
-		else
-		{
-			parallelOptions.MaxDegreeOfParallelism = 1;
-		}
-		Parallel.ForEach(fileList.Where((string it) => it != null), parallelOptions, delegate(string fullPath, ParallelLoopState ct)
-		{
-			ObservableConcurrentDictionaryEx<string, PvfTreeFileBase> observableConcurrentDictionaryEx = source;
-			string[] array = fullPath.Split(pathSeparators);
-			short num = 0;
-			int num2 = array.Length - 1;
-			StringBuilder stringBuilder = new StringBuilder();
-			string[] array2 = array;
-			foreach (string text in array2)
+			if (fullPath == null)
 			{
-				lock (this)
-				{
-					if (num == 0)
-					{
-						stringBuilder.Append(text);
-					}
-					else
-					{
-						stringBuilder.Append("/");
-						stringBuilder.Append(text);
-					}
-					if (observableConcurrentDictionaryEx.TryGetValue(text, out var value))
-					{
-						observableConcurrentDictionaryEx = value.Children;
-					}
-					else
-					{
-					PvfTreeFile pvfTreeFile = new PvfTreeFile(pvf, stringBuilder.ToString(), text, num == num2, num);
-						observableConcurrentDictionaryEx.AddTry(text, pvfTreeFile);
-						observableConcurrentDictionaryEx = pvfTreeFile.Children;
-					}
-				}
-				num++;
+				continue;
 			}
-		});
+			string[] segments = fullPath.Split(pathSeparators);
+			if (segments.Length == 0)
+			{
+				continue;
+			}
+			ObservableConcurrentDictionaryEx<string, PvfTreeFileBase> current = source;
+			pathBuilder.Clear();
+			int lastIndex = segments.Length - 1;
+			for (int i = 0; i < segments.Length; i++)
+			{
+				string segment = segments[i];
+				if (i == 0)
+				{
+					pathBuilder.Append(segment);
+				}
+				else
+				{
+					pathBuilder.Append('/').Append(segment);
+				}
+				if (current.TryGetValue(segment, out PvfTreeFileBase node))
+				{
+					current = node.Children;
+					continue;
+				}
+				PvfTreeFile tree = new PvfTreeFile(pvf, pathBuilder.ToString(), segment, i == lastIndex, (short)i);
+				current.AddTry(segment, tree);
+				current = tree.Children;
+			}
+		}
 		return Task.CompletedTask;
 	}
 

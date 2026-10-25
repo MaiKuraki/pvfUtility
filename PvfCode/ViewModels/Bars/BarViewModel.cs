@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Threading.Tasks;
@@ -447,27 +448,45 @@ public class BarViewModel : ViewModelBase
 			return;
 		}
 		AppCore.Logger.Warning(string.Format(AppSetting.Instance.GetIlogger()?.GetStr("mess_PvfPackLoading"), filePath));
+		// 分段计时：开包慢的时候不用猜是哪一段
+		Stopwatch openStopwatch = Stopwatch.StartNew();
 		bool isOpen = await Task.Run(() => AppCore.ViewModelBase.PVF.OpenPvfPack(filePath, AppCore.ViewModelBase.MainProgress));
+		long readPackageMs = openStopwatch.ElapsedMilliseconds;
 		if (!isOpen)
 		{
 			AppCore.ShowMsg(AppSetting.Instance.GetIlogger()?.GetStr("mess_CannotOpenPvfPack"), isError: true);
 			return;
 		}
 		AppCore.ViewModelBase.PVF.PvfIsOpen = true;
+		openStopwatch.Restart();
 		await ReloadTreeAsync();
+		long buildTreeMs = openStopwatch.ElapsedMilliseconds;
 		AppSetting.Instance.PathConfig.AddPvfOpenLog(filePath);
+		long backupMs = 0L;
 		if (isOpen)
 		{
 			if (AppSetting.Instance.PvfConfig.AutoTheBackupPvfConfig.AutoTheBackupPvfIsOpen)
 			{
+				openStopwatch.Restart();
 				await Task.Run(() => AppCore.ViewModelBase.PVF.SavePvfPack(AppSetting.Instance.PvfConfig.AutoTheBackupPvfConfig.CreateFilePath(AppCore.ViewModelBase.PVF), isFastMode: false, null));
+				backupMs = openStopwatch.ElapsedMilliseconds;
 			}
+			openStopwatch.Restart();
 			await AppSetting.Instance.SaveSetting();
+			if (openStopwatch.ElapsedMilliseconds > 200)
+			{
+				// 只有明显偏慢才单独报，避免刷屏
+				AppCore.Logger.Warning($"[开包耗时] 保存配置 {openStopwatch.ElapsedMilliseconds} ms（配置文件较大时属正常）");
+			}
 		}
+		long imagePacksMs = 0L;
 		if (!string.IsNullOrEmpty(AppSetting.Instance.ImagePacks2Options.ImagePacks2Path) && ImagePack2Service.Instance.Count == 0)
 		{
+			openStopwatch.Restart();
 			await Task.Run((Func<Task?>)AppCore.ViewModelBase.ImagePacks2ViewModel.LoadImagePacks2);
+			imagePacksMs = openStopwatch.ElapsedMilliseconds;
 		}
+		AppCore.Logger.Warning($"[开包耗时] 读包/解密 {readPackageMs} ms，建文件树 {buildTreeMs} ms，开包备份 {backupMs} ms，图片索引 {imagePacksMs} ms，合计 {readPackageMs + buildTreeMs + backupMs + imagePacksMs} ms");
 		AppCore.ClearMemory();
 	}
 
