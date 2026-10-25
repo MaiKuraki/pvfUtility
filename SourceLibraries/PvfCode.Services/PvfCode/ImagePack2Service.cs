@@ -132,9 +132,15 @@ public class ImagePack2Service : ViewModelBase
 			{
 				// 快路径：按索引里的 offset/length 只读这一张图，不再解析整个 NPK
 				ImagePack imagePack = ReadSingleImagePack(GetNpkFilePath(value), normalizedPath, index);
+				// 自检：解码出的帧数必须与索引阶段独立读到的帧数一致，
+				// 不一致说明读错了区间，直接判失败走整包解析，避免显示错误像素。
+				if (imagePack != null && value.Count > 0 && imagePack.ImgList != null && imagePack.ImgList.Count != value.Count)
+				{
+					imagePack = null;
+				}
 				if (imagePack == null)
 				{
-					// 兜底：索引不可用时退回整包解析（保持原有行为）
+					// 兜底：索引不可用或自检失败时退回整包解析（保持原有行为）
 					List<ImagePack> list = NpkCoder.ReadNpk(GetNpkFilePath(value));
 					imagePack = list?.FirstOrDefault(item => item.Path == normalizedPath);
 				}
@@ -169,6 +175,10 @@ public class ImagePack2Service : ViewModelBase
 			try
 			{
 				ImagePack imagePack = ReadSingleImagePack(GetNpkFilePath(value), normalizedPath, index);
+				if (imagePack != null && value.Count > 0 && imagePack.ImgList != null && imagePack.ImgList.Count != value.Count)
+				{
+					imagePack = null;
+				}
 				if (imagePack == null)
 				{
 					List<ImagePack> list = NpkCoder.ReadNpk(GetNpkFilePath(value));
