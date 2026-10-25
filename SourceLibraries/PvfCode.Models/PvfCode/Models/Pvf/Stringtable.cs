@@ -35,8 +35,8 @@ public class Stringtable
 
 	private List<StringTableEntry?> entries;
 
-	/// <summary>样例缓存：含非 ASCII 的条目，用于判断当前编码是否选错。</summary>
-	private string[] sampleTexts;
+	/// <summary>解析质量统计缓存（总数 / 含非 ASCII / 疑似异常）。</summary>
+	private (int Total, int NonAscii, int Suspicious)? statistics;
 
 	private Dictionary<PvfFileType, int> nameLabelByFileType;
 
@@ -66,7 +66,7 @@ public class Stringtable
 		}
 		entriesByText = null;
 		entries = null;
-		sampleTexts = null;
+		statistics = null;
 		if (entries != null)
 		{
 			entries.Clear();
@@ -183,71 +183,60 @@ public class Stringtable
 	}
 
 	/// <summary>
-	/// 取几条"像正常文本"的条目作为样例，用于判断当前编码是否选错。
+	/// 解析质量统计，用于判断当前编码是否选对。
 	///
-	/// 两个坑：
-	/// 1. stringtable 开头是文件路径（纯 ASCII），它们在任何编码下都一样，看不出问题；
-	/// 2. 开头还混有索引/二进制段，直接取"前几条含非 ASCII 的"会拿到乱码。
-	/// 所以从中间开始扫，并且要求：不含路径分隔符、不含控制字符、不含解码失败符。
-	/// 这样中英文服都能取到像样的样例。
+	/// 为什么不做"挑几条文本给人看"：stringtable 里混着文件路径、资源 key、索引段，
+	/// 挑到哪一类完全靠运气，之前三版分别挑到了路径、二进制乱码、资源 key，全是无效样例。
+	///
+	/// 改用统计：编码选错时，解码失败或产生控制字符的条目比例会明显升高。
+	/// 正确编码下这个比例应该极低。结果缓存，Clear 时重置。
 	/// </summary>
-	public string[] GetSampleTexts(int maxCount)
+	public (int Total, int NonAscii, int Suspicious) GetTextStatistics()
 	{
-		if (sampleTexts != null)
+		if (statistics.HasValue)
 		{
-			return sampleTexts;
+			return statistics.Value;
 		}
-		List<string> result = new List<string>(maxCount);
-		if (entries != null && entries.Count > 0)
+		int total = 0;
+		int nonAscii = 0;
+		int suspicious = 0;
+		if (entries != null)
 		{
-			int total = entries.Count;
-			int middle = total / 2;
-			CollectSamples(entries, middle, total, result, maxCount);
-			if (result.Count < maxCount)
+			for (int i = 0; i < entries.Count; i++)
 			{
-				CollectSamples(entries, 0, middle, result, maxCount);
+				string text = entries[i]?.Text;
+				if (string.IsNullOrEmpty(text))
+				{
+					continue;
+				}
+				total++;
+				bool hasNonAscii = false;
+				bool isSuspicious = false;
+				for (int k = 0; k < text.Length; k++)
+				{
+					char c = text[k];
+					if (c >= '\u0080')
+					{
+						hasNonAscii = true;
+					}
+					if (c == '\uFFFD' || (c < 0x20 && c != '\t'))
+					{
+						isSuspicious = true;
+						break;
+					}
+				}
+				if (hasNonAscii)
+				{
+					nonAscii++;
+				}
+				if (isSuspicious)
+				{
+					suspicious++;
+				}
 			}
 		}
-		sampleTexts = result.ToArray();
-		return sampleTexts;
-	}
-
-	private static void CollectSamples(List<StringTableEntry?> entries, int from, int to, List<string> result, int maxCount)
-	{
-		for (int i = from; i < to && result.Count < maxCount; i++)
-		{
-			string text = entries[i]?.Text;
-			if (!IsLikelyDisplayText(text))
-			{
-				continue;
-			}
-			result.Add(text.Length > 24 ? text.Substring(0, 24) + "…" : text);
-		}
-	}
-
-	private static bool IsLikelyDisplayText(string text)
-	{
-		if (string.IsNullOrEmpty(text) || text.Length < 2)
-		{
-			return false;
-		}
-		if (text.IndexOf('/') >= 0 || text.IndexOf('\\') >= 0)
-		{
-			return false;
-		}
-		for (int i = 0; i < text.Length; i++)
-		{
-			char c = text[i];
-			if (c == '\uFFFD')
-			{
-				return false;
-			}
-			if (c < 0x20 && c != '\t')
-			{
-				return false;
-			}
-		}
-		return true;
+		statistics = (total, nonAscii, suspicious);
+		return statistics.Value;
 	}
 
 	public int GetStringTableId(string str)

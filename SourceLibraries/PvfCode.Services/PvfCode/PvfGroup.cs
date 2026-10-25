@@ -368,17 +368,24 @@ public class PvfGroup : PvfPack
 		try
 		{
 			EncodingType current = base.OverAllEncodingType;
-			// 样例直接取已解析好的文本：stringtable 开头是文件路径，纯 ASCII 看不出编码对错，
-			// GetSampleTexts 会跳过它们挑含非 ASCII 的条目，且与实际显示完全一致。
-			string[] samples = base.Strtable.GetSampleTexts(3);
-			if (samples.Length > 0)
+			// stringtable 里混着路径、资源 key、索引段，挑具体条目当样例完全靠运气
+			// （实测挑到过路径、二进制乱码、资源 key 三类）。改用整体统计：
+			// 编码选错时会大量出现解码失败符或控制字符，比例会显著升高。
+			(int Total, int NonAscii, int Suspicious) stats = base.Strtable.GetTextStatistics();
+			if (stats.Total > 0)
 			{
-				logger.Warning("[编码] 当前 " + current + "，样例：" + string.Join(" / ", samples));
+				double badRate = stats.Suspicious * 100.0 / stats.Total;
+				logger.Warning($"[编码] 当前 {current}：共 {stats.Total} 条，含非 ASCII {stats.NonAscii} 条，疑似异常 {stats.Suspicious} 条（{badRate:F2}%）");
+				if (badRate >= 5.0)
+				{
+					logger.Warning($"[编码检测] 异常比例偏高，当前编码 {current} 很可能不是本包的正确编码。请在「公共设置 → 默认编码」里更换后重开");
+					return;
+				}
 			}
 			EncodingTypeDetector.Result result = EncodingTypeDetector.Detect(stringTableBytes);
 			if (result.Suggested.HasValue && result.Suggested.Value != current)
 			{
-				logger.Warning($"[编码检测] 当前 {current} 解出的内容可能不是本包的正确编码，建议改用 {result.Suggested.Value}。位置：公共设置 → 默认编码");
+				logger.Warning($"[编码检测] 建议改用 {result.Suggested.Value}（当前 {current}）。位置：公共设置 → 默认编码");
 			}
 		}
 		catch
