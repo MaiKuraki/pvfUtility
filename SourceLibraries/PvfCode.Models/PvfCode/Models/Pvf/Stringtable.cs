@@ -183,9 +183,13 @@ public class Stringtable
 	}
 
 	/// <summary>
-	/// 取几条"含非 ASCII 字符"的文本作为样例。
-	/// stringtable 开头大量是文件路径，纯 ASCII 看不出编码是否正确，
-	/// 所以直接跳过它们。这里用的是已经解析好的 Text，与界面显示完全一致。
+	/// 取几条"像正常文本"的条目作为样例，用于判断当前编码是否选错。
+	///
+	/// 两个坑：
+	/// 1. stringtable 开头是文件路径（纯 ASCII），它们在任何编码下都一样，看不出问题；
+	/// 2. 开头还混有索引/二进制段，直接取"前几条含非 ASCII 的"会拿到乱码。
+	/// 所以从中间开始扫，并且要求：不含路径分隔符、不含控制字符、不含解码失败符。
+	/// 这样中英文服都能取到像样的样例。
 	/// </summary>
 	public string[] GetSampleTexts(int maxCount)
 	{
@@ -194,33 +198,56 @@ public class Stringtable
 			return sampleTexts;
 		}
 		List<string> result = new List<string>(maxCount);
-		if (entries != null)
+		if (entries != null && entries.Count > 0)
 		{
-			for (int i = 0; i < entries.Count && result.Count < maxCount; i++)
+			int total = entries.Count;
+			int middle = total / 2;
+			CollectSamples(entries, middle, total, result, maxCount);
+			if (result.Count < maxCount)
 			{
-				string text = entries[i]?.Text;
-				if (string.IsNullOrEmpty(text))
-				{
-					continue;
-				}
-				bool hasNonAscii = false;
-				for (int k = 0; k < text.Length; k++)
-				{
-					if (text[k] >= '\u0080')
-					{
-						hasNonAscii = true;
-						break;
-					}
-				}
-				if (!hasNonAscii)
-				{
-					continue;
-				}
-				result.Add(text.Length > 24 ? text.Substring(0, 24) + "…" : text);
+				CollectSamples(entries, 0, middle, result, maxCount);
 			}
 		}
 		sampleTexts = result.ToArray();
 		return sampleTexts;
+	}
+
+	private static void CollectSamples(List<StringTableEntry?> entries, int from, int to, List<string> result, int maxCount)
+	{
+		for (int i = from; i < to && result.Count < maxCount; i++)
+		{
+			string text = entries[i]?.Text;
+			if (!IsLikelyDisplayText(text))
+			{
+				continue;
+			}
+			result.Add(text.Length > 24 ? text.Substring(0, 24) + "…" : text);
+		}
+	}
+
+	private static bool IsLikelyDisplayText(string text)
+	{
+		if (string.IsNullOrEmpty(text) || text.Length < 2)
+		{
+			return false;
+		}
+		if (text.IndexOf('/') >= 0 || text.IndexOf('\\') >= 0)
+		{
+			return false;
+		}
+		for (int i = 0; i < text.Length; i++)
+		{
+			char c = text[i];
+			if (c == '\uFFFD')
+			{
+				return false;
+			}
+			if (c < 0x20 && c != '\t')
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 
 	public int GetStringTableId(string str)
