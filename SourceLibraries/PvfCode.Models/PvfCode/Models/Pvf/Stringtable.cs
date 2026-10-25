@@ -219,7 +219,8 @@ public class Stringtable
 					{
 						hasNonAscii = true;
 					}
-					if (c == '\uFFFD' || (c < 0x20 && c != '\t'))
+					// 换行/回车/制表是多行文本的正常内容，不能算异常
+					if (c == '\uFFFD' || (c < 0x20 && c != '\t' && c != '\n' && c != '\r'))
 					{
 						isSuspicious = true;
 						break;
