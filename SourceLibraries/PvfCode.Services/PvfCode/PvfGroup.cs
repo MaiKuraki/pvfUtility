@@ -1,5 +1,6 @@
-using System;
+﻿using System;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -617,18 +618,31 @@ public class PvfGroup : PvfPack
 
 	private string GetNameByLabel(int nameLabel, PvfFile file)
 	{
-		for (int offset = 2; offset < file.DataLen - 9; offset += 5)
+		byte[] data = file.Data;
+		if (data == null || file.DataLen < 7)
 		{
-			if (file.Data[offset] == 5 && BitConverter.ToInt32(file.Data, offset + 1) == nameLabel)
+			return null;
+		}
+		ReadOnlySpan<int> offsets = file.SectionOffsets;
+		int limit = file.DataLen - 9;
+		for (int k = 0; k < offsets.Length; k++)
+		{
+			int offset = offsets[k];
+			if (offset >= limit)
 			{
-				if (offset < file.DataLen - 14 && file.Data[offset + 5] == 9 && file.Data[offset + 10] == 10)
-				{
-					return base.Strview.GetStrText(file.Data[offset + 6], base.Strtable.GetStringItem(BitConverter.ToInt32(file.Data, offset + 11)));
-				}
-				if (file.Data[offset + 5] == 7)
-				{
-					return base.Strtable.GetStringItem(BitConverter.ToInt32(file.Data, offset + 6));
-				}
+				break;
+			}
+			if (BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset + 1, 4)) != nameLabel)
+			{
+				continue;
+			}
+			if (offset < file.DataLen - 14 && data[offset + 5] == 9 && data[offset + 10] == 10)
+			{
+				return base.Strview.GetStrText(data[offset + 6], base.Strtable.GetStringItem(BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset + 11, 4))));
+			}
+			if (data[offset + 5] == 7)
+			{
+				return base.Strtable.GetStringItem(BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset + 6, 4)));
 			}
 		}
 		return null;
@@ -636,18 +650,31 @@ public class PvfGroup : PvfPack
 
 	private string GetNameByLabels(HashSet<int> nameLabels, PvfFile file)
 	{
-		for (int offset = 2; offset < file.DataLen - 9; offset += 5)
+		byte[] data = file.Data;
+		if (data == null || file.DataLen < 7)
 		{
-			if (file.Data[offset] == 5 && nameLabels.Contains(BitConverter.ToInt32(file.Data, offset + 1)))
+			return null;
+		}
+		ReadOnlySpan<int> offsets = file.SectionOffsets;
+		int limit = file.DataLen - 9;
+		for (int k = 0; k < offsets.Length; k++)
+		{
+			int offset = offsets[k];
+			if (offset >= limit)
 			{
-				if (offset < file.DataLen - 14 && file.Data[offset + 5] == 9 && file.Data[offset + 10] == 10)
-				{
-					return base.Strview.GetStrText(file.Data[offset + 6], base.Strtable.GetStringItem(BitConverter.ToInt32(file.Data, offset + 11)));
-				}
-				if (file.Data[offset + 5] == 7)
-				{
-					return base.Strtable.GetStringItem(BitConverter.ToInt32(file.Data, offset + 6));
-				}
+				break;
+			}
+			if (!nameLabels.Contains(BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset + 1, 4))))
+			{
+				continue;
+			}
+			if (offset < file.DataLen - 14 && data[offset + 5] == 9 && data[offset + 10] == 10)
+			{
+				return base.Strview.GetStrText(data[offset + 6], base.Strtable.GetStringItem(BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset + 11, 4))));
+			}
+			if (data[offset + 5] == 7)
+			{
+				return base.Strtable.GetStringItem(BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset + 6, 4)));
 			}
 		}
 		return null;

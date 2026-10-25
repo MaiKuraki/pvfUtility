@@ -136,13 +136,12 @@ public abstract class PvfPack : ModelBase
 		HashSet<int> hashSet = new HashSet<int>();
 		foreach (string file in fileList)
 		{
-			FileList.TryGetValue(file, out PvfFile value);
-			if (value != null && value.ItemCode.HasValue)
+			if (FileList.TryGetValue(file, out PvfFile value) && value != null && value.ItemCode.HasValue)
 			{
 				hashSet.Add(value.ItemCode.Value);
 			}
 		}
-		return hashSet.ToHashSet();
+		return hashSet;
 	}
 
 	public IEnumerable<string> GetFiles(string path, PvfFileType? fileType)
@@ -155,11 +154,11 @@ public abstract class PvfPack : ModelBase
 		{
 			return FileList.Keys;
 		}
-		string path2 = PathsHelper.PathFix(path);
+		string fixedPath = PathsHelper.PathFix(path);
 		List<string> list = new List<string>();
 		foreach (KeyValuePair<string, PvfFile> file in FileList)
 		{
-			if (file.Value.FileType == fileType.Value && PathsHelper.IsPathMatch(file.Key, path2))
+			if (file.Value.FileType == fileType.Value && PathsHelper.IsPathMatch(file.Key, fixedPath))
 			{
 				list.Add(file.Key);
 			}
@@ -173,9 +172,15 @@ public abstract class PvfPack : ModelBase
 		{
 			return new List<string>();
 		}
-		return from it in FileList
-			where it.Value.FileType == fileType
-			select it.Key;
+		List<string> list = new List<string>();
+		foreach (KeyValuePair<string, PvfFile> item in FileList)
+		{
+			if (item.Value.FileType == fileType)
+			{
+				list.Add(item.Key);
+			}
+		}
+		return list;
 	}
 
 	public IEnumerable<string> GetFiles(string path)
@@ -185,13 +190,29 @@ public abstract class PvfPack : ModelBase
 			return FileList.Keys;
 		}
 		string fixedPath = PathsHelper.PathFix(path);
-		return FileList.Where(item => PathsHelper.IsPathMatch(item.Key, fixedPath)).Select(item => item.Key);
+		List<string> list = new List<string>();
+		foreach (KeyValuePair<string, PvfFile> item in FileList)
+		{
+			if (PathsHelper.IsPathMatch(item.Key, fixedPath))
+			{
+				list.Add(item.Key);
+			}
+		}
+		return list;
 	}
 
 	public PvfFile[] GetFileObjs(string path)
 	{
 		string fixedPath = PathsHelper.PathFix(path);
-		return FileList.Where(item => PathsHelper.IsPathMatch(item.Key, fixedPath)).Select(item => item.Value).ToArray();
+		List<PvfFile> list = new List<PvfFile>();
+		foreach (KeyValuePair<string, PvfFile> item in FileList)
+		{
+			if (PathsHelper.IsPathMatch(item.Key, fixedPath))
+			{
+				list.Add(item.Value);
+			}
+		}
+		return list.ToArray();
 	}
 
 	public PvfFile GetFile(string filePath)
