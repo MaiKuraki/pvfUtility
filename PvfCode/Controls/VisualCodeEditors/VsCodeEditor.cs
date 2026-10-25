@@ -57,6 +57,13 @@ public class VsCodeEditor : WebView2, IComponentConnector
 
 	private void OnCoreWebView2InitializationCompleted(object? sender, CoreWebView2InitializationCompletedEventArgs e)
 	{
+		// WebView2 运行时缺失/初始化失败时 CoreWebView2 为 null。
+		// 原来直接访问 Settings 会抛 NRE，又被全局异常兜底吞掉，表现为页签白屏且无任何提示。
+		if (!e.IsSuccess || base.CoreWebView2 == null)
+		{
+			base.Visibility = Visibility.Collapsed;
+			return;
+		}
 		base.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
 		base.CoreWebView2.Settings.AreDevToolsEnabled = false;
 		base.CoreWebView2.DOMContentLoaded += OnDomContentLoaded;

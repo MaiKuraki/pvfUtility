@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -83,30 +84,32 @@ public class Stringtable
 		}
 		int num = BitConverter.ToInt32(stBytes, 0);
 		int num2 = stBytes.Length;
+		// 编码器只取一次：原来每个条目都调 Encoding.GetEncoding，是带锁的全局查表
+		Encoding textEncoding = Encoding.GetEncoding((int)this.encoding);
 		for (int i = 0; i < num; i++)
 		{
+			// 索引区不完整时停止，避免损坏文件直接抛越界
+			if (i * 4 + 12 > num2)
+			{
+				GetLogger().ShowMsg(AppSetting.Instance.GetIlogger()?.GetStr("mess_StringTableBinError"), isError: true);
+				break;
+			}
 			int num3 = BitConverter.ToInt32(stBytes, i * 4 + 4);
 			int num4 = BitConverter.ToInt32(stBytes, i * 4 + 8) - num3;
+			if (num4 < 0 || num3 < 0 || num4 > num2 || num3 + 4 + num4 > num2)
+			{
+				// 单条坏数据跳过，不再整体失败
+				continue;
+			}
 			StringTableEntry entry = new StringTableEntry
 			{
 				Index = i,
 				Bytes = new byte[num4]
 			};
-			if (num4 > num2)
-			{
-				GetLogger().ShowMsg(AppSetting.Instance.GetIlogger()?.GetStr("mess_StringTableBinError"), isError: true);
-				return;
-			}
 			Buffer.BlockCopy(stBytes, num3 + 4, entry.Bytes, 0, num4);
-			entry.Text = AppSetting.Instance.PvfConfig.StrTableAndStrViewConvertStrContent(Encoding.GetEncoding((int)this.encoding).GetString(entry.Bytes).TrimEnd(new char[1]));
-			lock (this)
-			{
-				entries.Add(entry);
-			}
-			if (!entriesByText.ContainsKey(entry.Text))
-			{
-				entriesByText.TryAdd(entry.Text, entry);
-			}
+			entry.Text = AppSetting.Instance.PvfConfig.StrTableAndStrViewConvertStrContent(textEncoding.GetString(entry.Bytes).TrimEnd(new char[1]));
+			entries.Add(entry);
+			entriesByText.TryAdd(entry.Text, entry);
 		}
 		IsStringTableUpdated = false;
 		InitializeNameLabels();
@@ -153,7 +156,8 @@ public class Stringtable
 
 	public string GetStringItem(int tableId, bool autoConvertStr = false)
 	{
-		if (tableId < 0 || tableId >= entries.Count)
+		// entries 在 stringtable.bin 未加载完成时为 null；原来直接访问 Count 会 NRE
+		if (entries == null || tableId < 0 || tableId >= entries.Count)
 		{
 			return string.Format(AppSetting.Instance.GetIlogger()?.GetStrNoReplace("mess_StringError"), tableId);
 		}
@@ -244,9 +248,11 @@ public class Stringtable
 	public void Encode_Stringtable(byte[] buff, int bufflength, uint key)
 	{
 		uint num = key;
-		for (int i = 0; i < bufflength; i += 4)
+		int aligned = bufflength & -4;
+		for (int i = 0; i < aligned; i += 4)
 		{
-			Array.Copy(BitConverter.GetBytes(num ^= BitConverter.ToUInt32(buff, i)), 0, buff, i, 4);
+			num ^= BinaryPrimitives.ReadUInt32LittleEndian(buff.AsSpan(i, 4));
+			BinaryPrimitives.WriteUInt32LittleEndian(buff.AsSpan(i, 4), num);
 		}
 	}
 

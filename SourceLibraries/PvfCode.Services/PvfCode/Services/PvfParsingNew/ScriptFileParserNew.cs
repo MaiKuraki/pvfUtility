@@ -77,8 +77,20 @@ public class ScriptFileParserNew
 		}
 	}
 
+	/// <summary>节嵌套深度上限。畸形脚本可能嵌套上万层，栈溢出会直接终止进程且无法捕获。</summary>
+	private const int MaxSectionDepth = 256;
+
 	private void ParseSectionChildren(SectionBase parentSection, List<ScriptItem> sectionItems)
 	{
+		ParseSectionChildren(parentSection, sectionItems, 0);
+	}
+
+	private void ParseSectionChildren(SectionBase parentSection, List<ScriptItem> sectionItems, int depth)
+	{
+		if (depth > MaxSectionDepth)
+		{
+			throw new Exception("脚本节嵌套超过 " + MaxSectionDepth + " 层，疑似文件损坏：" + sourceFile.FileName);
+		}
 		int count = sectionItems.Count;
 		for (int i = 0; i < count; i++)
 		{
@@ -96,12 +108,12 @@ public class ScriptFileParserNew
 				parentSection.Children.Add(pvfSection);
 				if (pvfSection.HasEndTag)
 				{
-					ParseSectionChildren(pvfSection, sectionItems.GetRange(i, num + 1));
+					ParseSectionChildren(pvfSection, sectionItems.GetRange(i, num + 1), depth + 1);
 					i = ((!parentSection.HasEndSection()) ? (i + (num + 1)) : (i + num));
 				}
 				else
 				{
-					ParseSectionChildren(pvfSection, sectionItems.GetRange(i, num));
+					ParseSectionChildren(pvfSection, sectionItems.GetRange(i, num), depth + 1);
 					i = ((!parentSection.HasEndSection()) ? (i + num) : (i + (num - 1)));
 				}
 			}

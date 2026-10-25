@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using Microsoft.VisualBasic;
@@ -52,33 +53,34 @@ internal static class PvfFileSearchExtensions
 
 	public static bool ContainsBinarySequence(this PvfFile file, byte[] sequence)
 	{
+		if (sequence == null || sequence.Length < 5 || !file.IsScriptFile)
+		{
+			return false;
+		}
 		int sequenceLength = sequence.Length;
-		if (!file.IsScriptFile)
+		byte[] data = file.Data;
+		int dataLen = file.DataLen;
+		if (data == null || dataLen < sequenceLength)
 		{
 			return false;
 		}
-		if (file.DataLen < sequenceLength)
+		byte first = sequence[0];
+		int head = BinaryPrimitives.ReadInt32LittleEndian(sequence.AsSpan(1, 4));
+		// 起点上限：保证 i + sequenceLength 不越界；同时保留 i+5 的 token 边界检查
+		int limit = dataLen - sequenceLength;
+		for (int i = 2; i <= limit && i + 5 <= dataLen; i += 5)
 		{
-			return false;
-		}
-		for (int i = 2; i < file.DataLen; i += 5)
-		{
-			if (file.Data[i] == sequence[0] && BitConverter.ToInt32(file.Data, i + 1) == BitConverter.ToInt32(sequence, 1))
+			if (data[i] != first)
 			{
-				if (sequence.Length == 5)
-				{
-					return true;
-				}
-				if (i + sequenceLength > file.DataLen)
-				{
-					return false;
-				}
-				byte[] candidate = new byte[sequenceLength];
-				Buffer.BlockCopy(file.Data, i, candidate, 0, sequenceLength);
-				if (DataHelper.BytesEquals(candidate, sequence))
-				{
-					return true;
-				}
+				continue;
+			}
+			if (BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(i + 1, 4)) != head)
+			{
+				continue;
+			}
+			if (sequenceLength == 5 || data.AsSpan(i, sequenceLength).SequenceEqual(sequence))
+			{
+				return true;
 			}
 		}
 		return false;

@@ -51,12 +51,23 @@ public class ByteHelper
 			return null;
 		}
 		int dDestinationSize = 0;
-		IntPtr intPtr = LocalAlloc(0, new IntPtr(dNeededBufferSize));
-		if (RtlCompressBuffer(2, buffer, Length, array, array.Length, 0u, out dDestinationSize, intPtr) != 0)
+		IntPtr workspace = LocalAlloc(0, new IntPtr(dNeededBufferSize));
+		if (workspace == IntPtr.Zero)
 		{
 			return null;
 		}
-		LocalFree(intPtr);
+		// 原来压缩失败直接 return，LocalAlloc 的工作区就泄漏了；这里用 finally 保证释放
+		try
+		{
+			if (RtlCompressBuffer(2, buffer, Length, array, array.Length, 0u, out dDestinationSize, workspace) != 0)
+			{
+				return null;
+			}
+		}
+		finally
+		{
+			LocalFree(workspace);
+		}
 		Array.Resize(ref array, (dDestinationSize + 3) & -4);
 		return array;
 	}

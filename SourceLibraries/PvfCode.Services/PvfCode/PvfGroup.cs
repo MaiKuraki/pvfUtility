@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -28,6 +29,9 @@ public class PvfGroup : PvfPack
 	private readonly byte[] footerSignature;
 
 	private readonly AsyncLock saveLock;
+
+	/// <summary>打开时需要跳过的文件名首段标记（沿用原有硬编码行为，改为字节比较以避免每文件 Split）。</summary>
+	private static readonly byte[] BlockedNameMarker = Encoding.ASCII.GetBytes("506807329_");
 
 	public PvfGroup()
 	{
@@ -117,18 +121,37 @@ public class PvfGroup : PvfPack
 				binaryWriter.Write(BitConverter.GetBytes(base.FileList.Count), 0, 4);
 				binaryWriter.Write(PvfAlgorithmHelper.EncryptionPvf(fileTreeData, base._fileTreeLength, base._fileTreeChecksum), 0, base._fileTreeLength);
 				int processedFileCount = 0;
-				foreach (PvfFile file in files)
+				// 复用一块缓冲做原地加密：原来每个文件都重新分配一个等长数组，
+				// 保存大包时峰值内存会翻倍，且给 GC 制造大量大对象。
+				byte[] encryptBuffer = ArrayPool<byte>.Shared.Rent(65536);
+				try
 				{
-					int blockLength = file.GetBlockLength();
-					if (blockLength > 0)
+					foreach (PvfFile file in files)
 					{
-						binaryWriter.Write(PvfAlgorithmHelper.EncryptionPvf(file.Data, blockLength, file.Checksum), 0, blockLength);
+						int blockLength = file.GetBlockLength();
+						if (blockLength > 0)
+						{
+							if (encryptBuffer.Length < blockLength)
+							{
+								// 先取到新缓冲再归还旧的：中间抛异常也不会把同一块缓冲归还两次
+								byte[] biggerBuffer = ArrayPool<byte>.Shared.Rent(blockLength);
+								ArrayPool<byte>.Shared.Return(encryptBuffer);
+								encryptBuffer = biggerBuffer;
+							}
+							Buffer.BlockCopy(file.Data, 0, encryptBuffer, 0, blockLength);
+							PvfAlgorithmHelper.EncryptionPvfInPlace(encryptBuffer.AsSpan(0, blockLength), file.Checksum);
+							binaryWriter.Write(encryptBuffer, 0, blockLength);
+						}
+						if (processedFileCount % 512 == 0)
+						{
+							progress?.Report(ProgressHelper.GetProgressNum(fileCount + processedFileCount, fileCount * 2));
+						}
+						processedFileCount++;
 					}
-					if (processedFileCount % 512 == 0)
-					{
-						progress?.Report(ProgressHelper.GetProgressNum(fileCount + processedFileCount, fileCount * 2));
-					}
-					processedFileCount++;
+				}
+				finally
+				{
+					ArrayPool<byte>.Shared.Return(encryptBuffer);
 				}
 				binaryWriter.Write(footerSignature);
 				binaryWriter.Flush();
@@ -212,17 +235,25 @@ public class PvfGroup : PvfPack
 						uint checksum = fileTreeReader.ReadUInt32();
 						int offset = fileTreeReader.ReadInt32();
 						PvfFile pvfFile = new PvfFile(fileNameChecksum, fileNameBytes, dataLen, checksum, offset);
-						if (pvfFile.FileName.Split(new char[2] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries)[0].Contains("506807329_"))
+						// 文件名只解码一次：原实现每个文件要调 2~3 次 FileName，每次都是一次 CP949 转换
+						string fileName = pvfFile.FileName;
+						int segmentEnd = 0;
+						while (segmentEnd < fileNameBytes.Length && fileNameBytes[segmentEnd] != (byte)'/' && fileNameBytes[segmentEnd] != (byte)'\\')
+						{
+							segmentEnd++;
+						}
+						// 原实现用 Split 取首段再 Contains，每个文件分配一个数组 + N 个字符串
+						if (fileNameBytes.AsSpan(0, segmentEnd).IndexOf(BlockedNameMarker) >= 0)
 						{
 							continue;
 						}
-						if (hasFooterSignature || !base.FileList.ContainsKey(pvfFile.FileName))
+						if (hasFooterSignature || !base.FileList.ContainsKey(fileName))
 						{
-							base.FileList.Add(pvfFile.FileName, pvfFile);
+							base.FileList.Add(fileName, pvfFile);
 						}
 						else
 						{
-							string text = pvfFile.FileName;
+							string text = fileName;
 							while (base.FileList.ContainsKey(text))
 							{
 								text += "(diff)";
@@ -236,11 +267,22 @@ public class PvfGroup : PvfPack
 						}
 					}
 					long dataStartOffset = binaryReader.BaseStream.Position;
-					foreach (KeyValuePair<string, PvfFile> item in base.FileList.Where<KeyValuePair<string, PvfFile>>((KeyValuePair<string, PvfFile> item) => item.Value.DataLen > 0))
+					// 按偏移排序后再读：原来按字典顺序逐文件 Seek，等于把整个包做随机读。
+					// 顺序读在机械盘上差 3~10 倍，SSD 上也能省掉大量 syscall。
+					List<KeyValuePair<string, PvfFile>> dataEntries = base.FileList
+						.Where<KeyValuePair<string, PvfFile>>((KeyValuePair<string, PvfFile> item) => item.Value.DataLen > 0)
+						.OrderBy<KeyValuePair<string, PvfFile>, long>((KeyValuePair<string, PvfFile> item) => item.Value.Offset)
+						.ToList();
+					long nextOffset = dataStartOffset;
+					foreach (KeyValuePair<string, PvfFile> item in dataEntries)
 					{
 						item.Value.Offset += dataStartOffset;
-						binaryReader.BaseStream.Seek(item.Value.Offset, SeekOrigin.Begin);
+						if (item.Value.Offset != nextOffset)
+						{
+							binaryReader.BaseStream.Seek(item.Value.Offset, SeekOrigin.Begin);
+						}
 						item.Value.InitFile(binaryReader.ReadBytes(item.Value.GetBlockLength()));
+						nextOffset = item.Value.Offset + item.Value.GetBlockLength();
 						if (!hasFooterSignature && duplicateFiles.Contains(item.Value))
 						{
 							item.Value.Rename(item.Key);
@@ -248,7 +290,9 @@ public class PvfGroup : PvfPack
 					}
 					progress.Report(100.0);
 				}
-				Task.Run(delegate
+				// stringtable / stringview 必须在使用前就绪。
+				// 原实现把它们丢进后台 Task.Run 后立刻返回成功，UI 一查名称就会拿到 null entries。
+				try
 				{
 					if (GetFile("stringtable.bin") != null)
 					{
@@ -257,7 +301,7 @@ public class PvfGroup : PvfPack
 					else
 					{
 						base.Strtable.InitDefault();
-							logger.Error(AppSetting.Instance.GetIlogger()?.GetStr("mess_StringTableNotFound"));
+						logger.Error(AppSetting.Instance.GetIlogger()?.GetStr("mess_StringTableNotFound"));
 					}
 					if (FileAny(AppSetting.Instance.PvfConfig.StringLstFileName))
 					{
@@ -266,8 +310,18 @@ public class PvfGroup : PvfPack
 					else
 					{
 						base.Strview.InitDefault();
-							logger.Error(string.Format(AppSetting.Instance.GetIlogger()?.GetStr("mess_StringLstNotFound"), AppSetting.Instance.PvfConfig.StringLstFileName));
+						logger.Error(string.Format(AppSetting.Instance.GetIlogger()?.GetStr("mess_StringLstNotFound"), AppSetting.Instance.PvfConfig.StringLstFileName));
 					}
+				}
+				catch (Exception ex)
+				{
+					// 损坏的字符串表不应该让整个包打不开
+					logger.Error("stringtable 初始化失败：" + ex);
+					base.Strtable.InitDefault();
+					base.Strview.InitDefault();
+				}
+				Task.Run(delegate
+				{
 					Task.Run(delegate
 					{
 						GetEquipmentpartsetInfo(this, out Dictionary<int, Dictionary<string, EquipmentPartSet>> dic);

@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -19,6 +20,43 @@ public class PvfFile : ModelBase, ICloneable
 	private bool isUpdated;
 
 	private bool isNewFile;
+
+	/// <summary>
+	/// 节起始偏移缓存（只记录 Data[i]==5 的位置）。惰性构建，Data 变更时失效。
+	/// 一个脚本通常只有几十到几百个节，而 token 有几千上万个，
+	/// 所以"扫节表"比"扫全部 token"快 20~50 倍，且只是一次 int[] 分配。
+	/// </summary>
+	private int[] sectionOffsets;
+
+	private int[] GetSectionOffsets()
+	{
+		int[] cached = sectionOffsets;
+		if (cached != null)
+		{
+			return cached;
+		}
+		if (Data == null || DataLen < 7)
+		{
+			return Array.Empty<int>();
+		}
+		List<int> offsets = new List<int>(32);
+		for (int i = 2; i < DataLen - 4; i += 5)
+		{
+			if (Data[i] == 5)
+			{
+				offsets.Add(i);
+			}
+		}
+		cached = offsets.ToArray();
+		sectionOffsets = cached;
+		return cached;
+	}
+
+	/// <summary>Data 内容变化后必须调用，否则会读到旧结构的节偏移。</summary>
+	public void InvalidateSectionOffsets()
+	{
+		sectionOffsets = null;
+	}
 
 	public int? ItemCode { get; set; }
 
@@ -184,6 +222,7 @@ public class PvfFile : ModelBase, ICloneable
 			Data = new byte[GetBlockLength()];
 			Buffer.BlockCopy(fileData, 0, Data, 0, DataLen);
 			Checksum = PvfAlgorithmHelper.CreateBuffKey(Data, GetBlockLength(), FileNameBytesChecksum);
+			InvalidateSectionOffsets();
 			IsUpdated = true;
 		}
 	}
@@ -191,11 +230,23 @@ public class PvfFile : ModelBase, ICloneable
 	public void InitFile(byte[] bytes)
 	{
 		Data = bytes;
-		Data = PvfAlgorithmHelper.DecryptionPvf(Data, GetBlockLength(), Checksum);
-		for (int i = 0; i < GetBlockLength() - DataLen; i++)
+		int blockLength = GetBlockLength();
+		if (blockLength > Data.Length)
 		{
-			Data[DataLen + i] = 0;
+			blockLength = Data.Length;
 		}
+		// 原地解密：省掉"读一块 + 再分配一块"的峰值翻倍
+		PvfAlgorithmHelper.DecryptionPvfInPlace(Data.AsSpan(0, blockLength), Checksum);
+		int paddingEnd = GetBlockLength();
+		if (paddingEnd > Data.Length)
+		{
+			paddingEnd = Data.Length;
+		}
+		for (int i = DataLen; i < paddingEnd; i++)
+		{
+			Data[i] = 0;
+		}
+		InvalidateSectionOffsets();
 	}
 
 	public void InitNewCopyFile(byte[] bytes, string name)
@@ -2015,11 +2066,13 @@ public class PvfFile : ModelBase, ICloneable
 		{
 			return false;
 		}
-		for (int i = 2; i < DataLen - 4; i += 5)
+		int[] offsets = GetSectionOffsets();
+		for (int k = 0; k < offsets.Length; k++)
 		{
-			if (Data[i] == 5 && BitConverter.ToInt32(Data, i + 1) == sectionId)
+			int offset = offsets[k];
+			if (BinaryPrimitives.ReadInt32LittleEndian(Data.AsSpan(offset + 1, 4)) == sectionId)
 			{
-				indexOut = i;
+				indexOut = offset;
 				return true;
 			}
 		}
@@ -2114,22 +2167,24 @@ public class PvfFile : ModelBase, ICloneable
 		{
 			return false;
 		}
-		if (!FindSectionIndex(stringTableId, out var _))
+		if (!FindSectionIndex(stringTableId, out var sectionIndex))
 		{
 			return false;
 		}
 		byte[] data = Data;
-		list = new List<int>();
-		for (int i = stringTableId + 5; i < DataLen; i += 5)
+		List<int> values = new List<int>();
+		list = values;
+		// 修正：原实现误用 stringTableId 作为字节偏移，应从找到的节头位置继续扫描
+		for (int i = sectionIndex + 5; i + 5 <= DataLen; i += 5)
 		{
-			byte b = data[i];
-			if (data[i] == 5)
+			byte type = data[i];
+			if (type == 5)
 			{
 				break;
 			}
-			if (b == 2 && i + 5 < DataLen)
+			if (type == 2)
 			{
-				list.Add(BitConverter.ToInt32(Data, i + 1));
+				values.Add(BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(i + 1, 4)));
 				continue;
 			}
 			return false;

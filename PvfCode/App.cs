@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
 using DevExpress.Xpf.Core;
+using Microsoft.Web.WebView2.Core;
 using Nito.AsyncEx;
 using PvfCode.Compatibility;
 using PvfCode.Localization;
@@ -105,6 +106,7 @@ public class App : Application
 			Application.Current.MainWindow = mainWindow;
 			base.MainWindow = mainWindow;
 			mainWindow.Show();
+			EnsureWebView2Runtime();
 			StartBackgroundServices();
 		}
 		catch (Exception ex)
@@ -201,7 +203,68 @@ public class App : Application
 	{
 		using (await UnhandledExceptionLock.LockAsync())
 		{
+			LogUnhandledException(exception);
 			ShowErrorMessage(await BuildExceptionMessageAsync(exception));
+		}
+	}
+
+	/// <summary>
+	/// 未处理异常落盘。原来只弹窗不写文件，用户反馈问题时拿不到堆栈。
+	/// 日志失败不能影响提示流程，所以整体吞掉异常。
+	/// </summary>
+	private static void LogUnhandledException(Exception exception)
+	{
+		try
+		{
+			string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "pvfUtility", "logs");
+			Directory.CreateDirectory(directory);
+			string path = Path.Combine(directory, "unhandled-" + DateTime.Now.ToString("yyyyMMdd") + ".log");
+			StringBuilder builder = new StringBuilder();
+			builder.Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff")).Append(' ');
+			builder.Append(exception.ToStringDemystified());
+			builder.AppendLine();
+			builder.AppendLine(new string('-', 60));
+			File.AppendAllText(path, builder.ToString(), Encoding.UTF8);
+		}
+		catch
+		{
+		}
+	}
+
+	/// <summary>
+	/// WebView2 运行时是唯一不能随包分发的外部依赖（Win11 自带，Win10 可能被精简掉）。
+	/// 缺失时给出明确提示，避免编辑器页签白屏且无任何线索。只提示一次。
+	/// </summary>
+	private static void EnsureWebView2Runtime()
+	{
+		try
+		{
+			string version = CoreWebView2Environment.GetAvailableBrowserVersionString();
+			if (!string.IsNullOrEmpty(version))
+			{
+				return;
+			}
+		}
+		catch (Exception)
+		{
+		}
+		try
+		{
+			string marker = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "pvfUtility", "webview2-warned");
+			if (File.Exists(marker))
+			{
+				return;
+			}
+			Directory.CreateDirectory(Path.GetDirectoryName(marker));
+			File.WriteAllText(marker, DateTime.Now.ToString("o"));
+			MessageBox.Show(
+				"未检测到 Microsoft Edge WebView2 运行时。\n\n代码编辑器、文件对比等页签依赖该组件，缺失时会显示空白；其余功能不受影响。\n\n请安装微软官方 “WebView2 Runtime (Evergreen)” 后重新打开程序。",
+				"缺少运行组件",
+				MessageBoxButton.OK,
+				MessageBoxImage.Warning);
+		}
+		catch (Exception)
+		{
 		}
 	}
 

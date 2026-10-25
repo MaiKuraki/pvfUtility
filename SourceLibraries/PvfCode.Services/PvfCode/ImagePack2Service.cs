@@ -127,17 +127,20 @@ public class ImagePack2Service : ViewModelBase
 		{
 			try
 			{
-				List<ImagePack> list = NpkCoder.ReadNpk(GetNpkFilePath(value));
-				if (list != null && list.Any())
+				// 快路径：按索引里的 offset/length 只读这一张图，不再解析整个 NPK
+				ImagePack imagePack = ReadSingleImagePack(GetNpkFilePath(value), normalizedPath, index);
+				if (imagePack == null)
 				{
-					ImagePack imagePack = list.FirstOrDefault(item => item.Path == normalizedPath);
-					if (imagePack != null && imagePack.ImgList != null && index < imagePack.ImgList.Count)
+					// 兜底：索引不可用时退回整包解析（保持原有行为）
+					List<ImagePack> list = NpkCoder.ReadNpk(GetNpkFilePath(value));
+					imagePack = list?.FirstOrDefault(item => item.Path == normalizedPath);
+				}
+				if (imagePack != null && imagePack.ImgList != null && index < imagePack.ImgList.Count)
+				{
+					return new ResultData<ImageSource>
 					{
-						return new ResultData<ImageSource>
-						{
-							Data = imagePack.ImgList[index].ImageSource
-						};
-					}
+						Data = imagePack.ImgList[index].ImageSource
+					};
 				}
 			}
 			catch (Exception ex)
@@ -162,17 +165,18 @@ public class ImagePack2Service : ViewModelBase
 		{
 			try
 			{
-				List<ImagePack> list = NpkCoder.ReadNpk(GetNpkFilePath(value));
-				if (list != null && list.Any())
+				ImagePack imagePack = ReadSingleImagePack(GetNpkFilePath(value), normalizedPath, index);
+				if (imagePack == null)
 				{
-					ImagePack imagePack = list.FirstOrDefault(item => item.Path == normalizedPath);
-					if (imagePack != null && imagePack.ImgList != null && index < imagePack.ImgList.Count)
+					List<ImagePack> list = NpkCoder.ReadNpk(GetNpkFilePath(value));
+					imagePack = list?.FirstOrDefault(item => item.Path == normalizedPath);
+				}
+				if (imagePack != null && imagePack.ImgList != null && index < imagePack.ImgList.Count)
+				{
+					return new ResultData<Bitmap>
 					{
-						return new ResultData<Bitmap>
-						{
-							Data = imagePack.ImgList[index].Picture
-						};
-					}
+						Data = imagePack.ImgList[index].Picture
+					};
 				}
 			}
 			catch (Exception)
@@ -180,6 +184,106 @@ public class ImagePack2Service : ViewModelBase
 			}
 		}
 		return new ResultData<Bitmap>();
+	}
+
+	// ---- NPK 单图读取 ----
+	// 只缓存"图片路径 -> (offset,length)"，不缓存像素；缓存有上限，超了整体清空，避免无界增长。
+	private static readonly object NpkIndexLock = new object();
+	private static readonly Dictionary<string, Dictionary<string, long>> NpkIndexCache = new Dictionary<string, Dictionary<string, long>>(StringComparer.OrdinalIgnoreCase);
+	private static readonly Dictionary<string, long> EmptyNpkIndex = new Dictionary<string, long>(0);
+	private const int MaxCachedNpkIndexCount = 6;
+
+	/// <summary>
+	/// 按索引只读目标图片的字节区间并解码，避免为了取一张图把整个 NPK 解析一遍。
+	/// 任何异常或索引缺失都返回 null，由调用方回退到整包解析。
+	/// </summary>
+	private static ImagePack ReadSingleImagePack(string npkPath, string imagePath, int index)
+	{
+		if (string.IsNullOrEmpty(npkPath) || !TryGetImageLocation(npkPath, imagePath, out int offset, out int length))
+		{
+			return null;
+		}
+		try
+		{
+			byte[] data = new byte[length];
+			using (FileStream stream = new FileStream(npkPath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.RandomAccess))
+			{
+				stream.Seek(offset, SeekOrigin.Begin);
+				stream.ReadExactly(data.AsSpan());
+			}
+			// Offset 必须是 0：ReadImg 会把 pack.Offset 当作流内起点
+			ImagePack pack = new ImagePack
+			{
+				Path = imagePath,
+				Offset = 0,
+				Length = length
+			};
+			NpkCoder.ReadImg(data, pack, length);
+			if (pack.ImgList == null || index < 0 || index >= pack.ImgList.Count)
+			{
+				return null;
+			}
+			return pack;
+		}
+		catch
+		{
+			return null;
+		}
+	}
+
+	private static bool TryGetImageLocation(string npkPath, string imagePath, out int offset, out int length)
+	{
+		offset = 0;
+		length = 0;
+		Dictionary<string, long> index;
+		lock (NpkIndexLock)
+		{
+			if (!NpkIndexCache.TryGetValue(npkPath, out index) || index == null)
+			{
+				if (NpkIndexCache.Count >= MaxCachedNpkIndexCount)
+				{
+					NpkIndexCache.Clear();
+				}
+				// 失败也缓存空表，避免每次取图都重新打开一次坏包
+				index = BuildNpkIndex(npkPath) ?? EmptyNpkIndex;
+				NpkIndexCache[npkPath] = index;
+			}
+		}
+		if (index == null || !index.TryGetValue(imagePath, out long packed))
+		{
+			return false;
+		}
+		offset = (int)(uint)(packed >> 32);
+		length = (int)(uint)packed;
+		return length > 0;
+	}
+
+	private static Dictionary<string, long> BuildNpkIndex(string npkPath)
+	{
+		try
+		{
+			using FileStream stream = new FileStream(npkPath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
+			List<ImagePack> packs = NpkCoder.ReadInfo(stream);
+			if (packs == null || packs.Count == 0)
+			{
+				return null;
+			}
+			Dictionary<string, long> map = new Dictionary<string, long>(packs.Count, StringComparer.OrdinalIgnoreCase);
+			for (int i = 0; i < packs.Count; i++)
+			{
+				ImagePack pack = packs[i];
+				if (pack?.Path == null || pack.Length <= 0)
+				{
+					continue;
+				}
+				map[pack.Path] = ((long)(uint)pack.Offset << 32) | (uint)pack.Length;
+			}
+			return map;
+		}
+		catch
+		{
+			return null;
+		}
 	}
 
 	public ResultData ImgGoToNpkFile(string imgPath)
