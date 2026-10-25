@@ -227,12 +227,13 @@ public static class NpkCoder
 		ConcurrentDictionary<string, UtImgFileTemp> concurrentDictionary = new ConcurrentDictionary<string, UtImgFileTemp>();
 		List<string> list = new List<string>(Directory.EnumerateFiles(dirName, "*.npk", SearchOption.TopDirectoryOnly));
 		ConcurrentDictionary<int, string> concurrentDictionary2 = new ConcurrentDictionary<int, string>();
-		// 各 NPK 之间互不依赖，真正并行；并发度按"磁盘并行 + 留出 UI 余量"取，不跟核数线性放大
+		// 各 NPK 之间互不依赖，真正并行；并发度按磁盘类型自适应（见 ResolveNpkReadConcurrency）
+		int concurrency = ResolveNpkReadConcurrency(dirName);
 		await Task.Run(delegate
 		{
 			ParallelOptions parallelOptions = new ParallelOptions
 			{
-				MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount / 2, 2, 4)
+				MaxDegreeOfParallelism = concurrency
 			};
 			Parallel.ForEach(list, parallelOptions, delegate(string item)
 			{
@@ -247,9 +248,39 @@ public static class NpkCoder
 		};
 	}
 
+	/// <summary>
+	/// 按目标目录所在磁盘类型决定并行度：
+	/// 机械盘随机读要付寻道代价，并行反而更慢；SSD 可以放心并行；探测失败取保守值。
+	/// SeekPenalty 查询走 IOCTL_STORAGE_QUERY_PROPERTY，不需要管理员权限。
+	/// </summary>
+	private static int ResolveNpkReadConcurrency(string directoryPath)
+	{
+		HardwareType hardwareType = HardwareType.Unknown;
+		try
+		{
+			string root = Path.GetPathRoot(Path.GetFullPath(directoryPath));
+			if (!string.IsNullOrEmpty(root))
+			{
+				hardwareType = DiskDetectionUtils.DetectDrive(root).HardwareType;
+			}
+		}
+		catch
+		{
+			hardwareType = HardwareType.Unknown;
+		}
+		if (hardwareType == HardwareType.Hdd)
+		{
+			return 1;
+		}
+		if (hardwareType == HardwareType.Ssd)
+		{
+			return 4;
+		}
+		return 2;
+	}
+
 	/// <summary>NPK 索引记录：offset(4) + length(4) + 加密文件名(256)。</summary>
 	private const int NpkIndexRecordSize = 264;
-
 	private const int NpkIndexNameOffset = 8;
 
 	private const int NpkIndexNameLength = 256;
