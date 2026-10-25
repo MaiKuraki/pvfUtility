@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Drawing;
@@ -9,6 +10,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Media;
+using Microsoft.Win32.SafeHandles;
 using PvfCode.Dot;
 using PvfCode.NPK.Utils.Lib;
 using PvfCode.NPK.Utils.Models;
@@ -69,18 +71,27 @@ public static class NpkCoder
 
 	public static string ReadPath(this Stream stream)
 	{
-		byte[] array = new byte[256];
-		int i;
-		for (i = 0; i < 256; i++)
+		// 原来逐字节 ReadByte 256 次；改成一次读满 256 字节再在内存里异或。
+		// 消费字节数与旧实现一致（旧实现靠 Seek(255-i) 补齐到 256）。
+		byte[] keyBytes = Key;
+		Span<byte> buffer = stackalloc byte[256];
+		int read = stream.ReadAtLeast(buffer, 256, throwOnEndOfStream: false);
+		if (read <= 0)
 		{
-			array[i] = (byte)(stream.ReadByte() ^ Key[i]);
-			if (array[i] == 0)
+			return string.Empty;
+		}
+		int length = 0;
+		while (length < read)
+		{
+			byte value = (byte)(buffer[length] ^ keyBytes[length]);
+			if (value == 0)
 			{
 				break;
 			}
+			buffer[length] = value;
+			length++;
 		}
-		stream.Seek(255 - i);
-		return System.Text.Encoding.GetEncoding("gbk").GetString(array, 0, i);
+		return GbkEncoding.GetString(buffer.Slice(0, length));
 	}
 
 	public static async Task<string> ReadPathNewAsync(this Stream stream)
@@ -213,20 +224,54 @@ public static class NpkCoder
 	{
 		_fileNameIdCounter = 1;
 		StringBuilder buiError = new StringBuilder();
-		await Task.Delay(1);
 		ConcurrentDictionary<string, UtImgFileTemp> concurrentDictionary = new ConcurrentDictionary<string, UtImgFileTemp>();
 		List<string> list = new List<string>(Directory.EnumerateFiles(dirName, "*.npk", SearchOption.TopDirectoryOnly));
 		ConcurrentDictionary<int, string> concurrentDictionary2 = new ConcurrentDictionary<int, string>();
-		foreach (string item in list)
+		// 各 NPK 之间互不依赖，真正并行；并发度按"磁盘并行 + 留出 UI 余量"取，不跟核数线性放大
+		await Task.Run(delegate
 		{
-			ReadNpkInfo2(item, concurrentDictionary, buiError, concurrentDictionary2);
-		}
+			ParallelOptions parallelOptions = new ParallelOptions
+			{
+				MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount / 2, 2, 4)
+			};
+			Parallel.ForEach(list, parallelOptions, delegate(string item)
+			{
+				ReadNpkInfo2(item, concurrentDictionary, buiError, concurrentDictionary2);
+			});
+		});
 		return new ResultData<Dictionary<string, UtImgFile>, string, Dictionary<int, string>>
 		{
 			Data = ((IEnumerable<KeyValuePair<string, UtImgFileTemp>>)concurrentDictionary).ToDictionary((Func<KeyValuePair<string, UtImgFileTemp>, string>)((KeyValuePair<string, UtImgFileTemp> it) => it.Key), (Func<KeyValuePair<string, UtImgFileTemp>, UtImgFile>)((KeyValuePair<string, UtImgFileTemp> it) => it.Value)),
 			Data2 = buiError.ToString(),
 			Data3 = concurrentDictionary2.ToDictionary((KeyValuePair<int, string> it) => it.Key, (KeyValuePair<int, string> it) => it.Value)
 		};
+	}
+
+	/// <summary>NPK 索引记录：offset(4) + length(4) + 加密文件名(256)。</summary>
+	private const int NpkIndexRecordSize = 264;
+
+	private const int NpkIndexNameOffset = 8;
+
+	private const int NpkIndexNameLength = 256;
+
+	private static readonly Encoding GbkEncoding = System.Text.Encoding.GetEncoding("gbk");
+
+	/// <summary>解密一个 256 字节的 NPK 文件名区，返回去掉结尾 0 的字符串。</summary>
+	private static string DecodeNpkName(ReadOnlySpan<byte> raw)
+	{
+		byte[] keyBytes = Key;
+		Span<byte> buffer = stackalloc byte[NpkIndexNameLength];
+		int length = 0;
+		for (int i = 0; i < NpkIndexNameLength; i++)
+		{
+			byte value = (byte)(raw[i] ^ keyBytes[i]);
+			if (value == 0)
+			{
+				break;
+			}
+			buffer[length++] = value;
+		}
+		return GbkEncoding.GetString(buffer.Slice(0, length));
 	}
 
 	private static void ReadNpkInfo2(string filePath, ConcurrentDictionary<string, UtImgFileTemp> dic, StringBuilder buiError, ConcurrentDictionary<int, string> npkFilePathDic)
@@ -240,45 +285,87 @@ public static class NpkCoder
 		npkFilePathDic.TryAdd(fileNameId, fileName);
 		try
 		{
-			using FileStream fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true);
-			if (!(fileStream.ReadString(System.Text.Encoding.Default) == "NeoplePack_Bill"))
+			// 索引区一次读一条 264 字节记录，替代原来"ReadInt + Seek + ReadPath(256 次 ReadByte)"
+			byte[] record = new byte[NpkIndexRecordSize];
+			int entryCount;
+			(int offset, string name)[] entries;
+			using (FileStream fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan))
 			{
-				return;
-			}
-			fileStream.Seek(0L, SeekOrigin.Begin);
-			if (!(fileStream.ReadString(System.Text.Encoding.Default) == "NeoplePack_Bill"))
-			{
-				return;
-			}
-			int num = fileStream.ReadInt();
-			if (num <= 0)
-			{
-				return;
-			}
-			(int, string)[] array = new(int, string)[num];
-			for (int i = 0; i < num; i++)
-			{
-				int item = fileStream.ReadInt();
-				fileStream.Seek(4L);
-				string item2 = fileStream.ReadPath();
-				array[i] = (item, item2);
-			}
-			fileStream.Seek(32L);
-			_ = new byte[16];
-			(int, string)[] array2 = array;
-			for (int j = 0; j < array2.Length; j++)
-			{
-				var (num2, text) = array2[j];
-				fileStream.Seek(num2, SeekOrigin.Begin);
-				string text2 = fileStream.ReadString();
-				if (text2 == "Neople Img File" || text2 == "Neople Image File")
+				Span<byte> head = stackalloc byte[20];
+				if (fileStream.ReadAtLeast(head, 20, throwOnEndOfStream: false) < 20)
 				{
-					if (!dic.ContainsKey(text))
+					return;
+				}
+				// 注意：SequenceEqual 要求两侧长度相同，签名 "NeoplePack_Bill" 是 15 字节（不含结尾 0）
+				if (!head.Slice(0, 15).SequenceEqual("NeoplePack_Bill"u8))
+				{
+					return;
+				}
+				entryCount = BinaryPrimitives.ReadInt32LittleEndian(head.Slice(16, 4));
+				if (entryCount <= 0)
+				{
+					return;
+				}
+				entries = new (int, string)[entryCount];
+				for (int i = 0; i < entryCount; i++)
+				{
+					if (fileStream.ReadAtLeast(record, NpkIndexRecordSize, throwOnEndOfStream: false) < NpkIndexRecordSize)
 					{
-						dic.TryAdd(text, new UtImgFileTemp(num2, fileNameId));
+						entries[i] = (-1, null);
+						continue;
 					}
-					fileStream.Seek(12L);
-					dic[text].Count = fileStream.ReadInt();
+					int offset = BinaryPrimitives.ReadInt32LittleEndian(record.AsSpan(0, 4));
+					string name = DecodeNpkName(record.AsSpan(NpkIndexNameOffset, NpkIndexNameLength));
+					entries[i] = (offset, name);
+				}
+			}
+			// 第二遍只需要每张图的签名和帧数：一次读 40 字节，替代原来两次 Seek + 两轮逐字节读取
+			using SafeFileHandle handle = File.OpenHandle(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+			byte[] imageHeader = new byte[40];
+			for (int j = 0; j < entries.Length; j++)
+			{
+				int offset = entries[j].offset;
+				string name = entries[j].name;
+				if (offset <= 0 || name == null)
+				{
+					continue;
+				}
+				int read = RandomAccess.Read(handle, imageHeader, offset);
+				if (read < 20)
+				{
+					continue;
+				}
+				int signatureLength;
+				if (imageHeader.AsSpan(0, 15).SequenceEqual("Neople Img File"u8))
+				{
+					signatureLength = 15;
+				}
+				else if (read >= 17 && imageHeader.AsSpan(0, 17).SequenceEqual("Neople Image File"u8))
+				{
+					signatureLength = 17;
+				}
+				else
+				{
+					continue;
+				}
+				// 原实现：ReadString 消费"签名 + 结尾 0"，再相对 Seek(12)，所以帧数在 offset + 签名长 + 13
+				int countOffset = signatureLength + 13;
+				if (countOffset + 4 > read)
+				{
+					continue;
+				}
+				int count = BinaryPrimitives.ReadInt32LittleEndian(imageHeader.AsSpan(countOffset, 4));
+				if (!dic.TryGetValue(name, out UtImgFileTemp entry))
+				{
+					entry = new UtImgFileTemp(offset, fileNameId);
+					if (!dic.TryAdd(name, entry))
+					{
+						dic.TryGetValue(name, out entry);
+					}
+				}
+				if (entry != null)
+				{
+					entry.Count = count;
 				}
 			}
 		}
