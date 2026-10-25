@@ -15,6 +15,69 @@ public static class StrConvert
 
 	private static Dictionary<int, int> kRNVlN3Fm2;
 
+	// 按字符预筛：只有出现在转换表里的字符才值得走逐字符替换。
+	// 台服包的文本本来就是繁体，查"简->繁"表必然全部不命中，
+	// 没有这张表时每个字符串都要 new StringBuilder + 逐字符哈希，纯属浪费。
+	private static bool[] bmpToTraditional;
+
+	private static bool[] bmpToSimplified;
+
+	private static bool[] BuildBmpMap(Dictionary<int, int> dictionary)
+	{
+		bool[] map = new bool[65536];
+		if (dictionary == null)
+		{
+			return map;
+		}
+		foreach (int key in dictionary.Keys)
+		{
+			if (key >= 0 && key < 65536)
+			{
+				map[key] = true;
+			}
+		}
+		return map;
+	}
+
+	private static bool[] GetBmpMap(ConvertType convertType, Dictionary<int, int> dictionary)
+	{
+		if (convertType == ConvertType.ToTraditional)
+		{
+			if (bmpToTraditional == null)
+			{
+				bmpToTraditional = BuildBmpMap(dictionary);
+			}
+			return bmpToTraditional;
+		}
+		if (convertType == ConvertType.ToSimplified)
+		{
+			if (bmpToSimplified == null)
+			{
+				bmpToSimplified = BuildBmpMap(dictionary);
+			}
+			return bmpToSimplified;
+		}
+		return null;
+	}
+
+	private static bool ContainsConvertibleChar(string str, bool[] map)
+	{
+		for (int i = 0; i < str.Length; i++)
+		{
+			char c = str[i];
+			// 代理对（emoji 等）按原逻辑整串处理，避免漏转
+			if (char.IsSurrogate(c))
+			{
+				return true;
+			}
+			if (map[c])
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private static bool UdmVBwLYGs(int P_0, out char? P_1, out char? P_2)
 	{
 		if (P_0 < 0 || P_0 > 1114111 || (P_0 >= 55296 && P_0 <= 57343))
@@ -68,6 +131,12 @@ public static class StrConvert
 			return str;
 		}
 		Dictionary<int, int> dictionary = bofVa0ORUw(convertType);
+		bool[] bmpMap = GetBmpMap(convertType, dictionary);
+		if (bmpMap != null && !ContainsConvertibleChar(str, bmpMap))
+		{
+			// 整串没有任何字符需要转换，直接返回
+			return str;
+		}
 		int num = str.Length;
 		StringBuilder stringBuilder = new StringBuilder(str);
 		for (int i = 0; i < num; i++)
