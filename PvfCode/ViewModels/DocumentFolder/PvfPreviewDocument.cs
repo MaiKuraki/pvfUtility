@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Globalization;
@@ -506,7 +506,7 @@ public sealed class PvfPreviewDocument : DocumentBase
 	private string aniPreviewStatus;
 	private PvfPreviewTag selectedTag;
 	private int aniLoadAttempts;
-	private bool refreshQueued;
+	private DispatcherTimer refreshTimer;
 
 	public ObservableCollection<PvfPreviewTag> Tags { get; } = new();
 
@@ -606,7 +606,8 @@ public sealed class PvfPreviewDocument : DocumentBase
 
 	public void RefreshPreview()
 	{
-		refreshQueued = false;
+		// 直接调用时取消待处理的防抖刷新，避免重复执行
+		refreshTimer?.Stop();
 		if (sourceDocument?.File == null)
 		{
 			return;
@@ -2468,12 +2469,29 @@ public sealed class PvfPreviewDocument : DocumentBase
 
 	private void OnSourceTextChanged(object sender, EventArgs e)
 	{
-		if (refreshQueued || Application.Current == null)
+		if (Application.Current == null)
 		{
 			return;
 		}
-		refreshQueued = true;
-		Application.Current.Dispatcher.BeginInvoke((Action)RefreshPreview, DispatcherPriority.Background);
+		// 防抖：连续输入时只在停手 120ms 后重建一次。
+		// 原来每次文本变更都排一次刷新（Background 优先级，约等于每帧一次），
+		// 而一次刷新要重建整棵预览对象树，连打十几个字就是十几次重建。
+		if (refreshTimer == null)
+		{
+			refreshTimer = new DispatcherTimer(DispatcherPriority.Background, Application.Current.Dispatcher)
+			{
+				Interval = TimeSpan.FromMilliseconds(120)
+			};
+			refreshTimer.Tick += OnRefreshTimerTick;
+		}
+		refreshTimer.Stop();
+		refreshTimer.Start();
+	}
+
+	private void OnRefreshTimerTick(object sender, EventArgs e)
+	{
+		refreshTimer?.Stop();
+		RefreshPreview();
 	}
 
 	private void OnSourcePreviewContentChanged(object sender, EventArgs e)
@@ -2485,6 +2503,7 @@ public sealed class PvfPreviewDocument : DocumentBase
 
 	private void UnsubscribeSource()
 	{
+		refreshTimer?.Stop();
 		if (sourceDocument != null)
 		{
 			sourceDocument.PreviewContentChanged -= OnSourcePreviewContentChanged;
