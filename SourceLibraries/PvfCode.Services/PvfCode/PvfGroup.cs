@@ -304,9 +304,12 @@ public class PvfGroup : PvfPack
 				try
 				{
 					readStopwatch.Restart();
-					if (GetFile("stringtable.bin") != null)
+					PvfFile stringTableFile = GetFile("stringtable.bin");
+					if (stringTableFile != null)
 					{
-						base.Strtable.Loadstringtable(GetFile("stringtable.bin").Data, base.OverAllEncodingType, this);
+						base.Strtable.Loadstringtable(stringTableFile.Data, base.OverAllEncodingType, this);
+						// 编码自检：只提示，不自动改配置（猜错会让用户读到乱码还找不到原因）
+						ReportEncodingMismatch(stringTableFile.Data);
 					}
 					else
 					{
@@ -353,6 +356,32 @@ public class PvfGroup : PvfPack
 				logger.Error(string.Format(AppSetting.Instance.GetIlogger()?.GetStr("mess_OpenPackageError"), ex.Message));
 				return Task.FromResult(result: false);
 			}
+		}
+	}
+
+	/// <summary>
+	/// 打开包时校验字符串表编码。只输出提示，不修改配置：
+	/// 用户看的是乱码时，"当前编码可能不对，建议改成 X" 这句提示比任何自动修复都有用。
+	/// </summary>
+	private void ReportEncodingMismatch(byte[] stringTableBytes)
+	{
+		try
+		{
+			EncodingType current = base.OverAllEncodingType;
+			EncodingTypeDetector.Result result = EncodingTypeDetector.Detect(stringTableBytes, current);
+			// 每次都打印当前编码解出的样例：切错编码时用户一眼就能看出是乱码
+			if (result.Samples.Length > 0)
+			{
+				logger.Warning("[编码] 当前 " + current + "，样例：" + string.Join(" / ", result.Samples));
+			}
+			if (result.Suggested.HasValue && result.Suggested.Value != current)
+			{
+				logger.Warning($"[编码检测] 当前 {current} 解出的内容可能不是本包的正确编码，建议改用 {result.Suggested.Value}。位置：公共设置 → 默认编码");
+			}
+		}
+		catch
+		{
+			// 探测失败不能影响开包
 		}
 	}
 
