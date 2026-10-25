@@ -51,6 +51,22 @@ public static class StrConvert
 		{
 			return str;
 		}
+		// 纯 ASCII（英文、数字、路径、符号）不存在繁简差异。
+		// stringtable 与 Str 文件里这类占绝大多数，直接返回可省掉
+		// 一次 StringBuilder 复制和逐字符哈希查表。
+		bool hasNonAscii = false;
+		for (int i = 0; i < str.Length; i++)
+		{
+			if (str[i] >= '\u0080')
+			{
+				hasNonAscii = true;
+				break;
+			}
+		}
+		if (!hasNonAscii)
+		{
+			return str;
+		}
 		Dictionary<int, int> dictionary = bofVa0ORUw(convertType);
 		int num = str.Length;
 		StringBuilder stringBuilder = new StringBuilder(str);

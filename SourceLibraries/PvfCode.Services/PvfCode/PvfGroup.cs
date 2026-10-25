@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -216,6 +217,9 @@ public class PvfGroup : PvfPack
 			try
 			{
 				base.PvfPackFilePath = path;
+				long fileTableMs = 0L;
+				long dataMs = 0L;
+				Stopwatch readStopwatch = Stopwatch.StartNew();
 				using (BinaryReader binaryReader = new BinaryReader(File.OpenRead(path)))
 				{
 					HashSet<PvfFile> duplicateFiles = new HashSet<PvfFile>();
@@ -226,7 +230,8 @@ public class PvfGroup : PvfPack
 					base._fileTreeLength = binaryReader.ReadInt32();
 					base._fileTreeChecksum = binaryReader.ReadUInt32();
 					int fileCount = binaryReader.ReadInt32();
-					base.FileList = new Dictionary<string, PvfFile>();
+					// 预设容量：36 万条不预设会经历多次扩容 + 整表 rehash
+					base.FileList = new Dictionary<string, PvfFile>(fileCount);
 					BinaryReader fileTreeReader = new BinaryReader(new MemoryStream(PvfAlgorithmHelper.DecryptionPvf(binaryReader.ReadBytes(base._fileTreeLength), base._fileTreeLength, base._fileTreeChecksum)));
 					for (int i = 0; i < fileCount; i++)
 					{
@@ -267,6 +272,8 @@ public class PvfGroup : PvfPack
 							progress.Report(ProgressHelper.GetProgressNum(i, fileCount));
 						}
 					}
+					fileTableMs = readStopwatch.ElapsedMilliseconds;
+					readStopwatch.Restart();
 					long dataStartOffset = binaryReader.BaseStream.Position;
 					// 按偏移排序后再读：原来按字典顺序逐文件 Seek，等于把整个包做随机读。
 					// 顺序读在机械盘上差 3~10 倍，SSD 上也能省掉大量 syscall。
@@ -291,10 +298,12 @@ public class PvfGroup : PvfPack
 					}
 					progress.Report(100.0);
 				}
+				dataMs = readStopwatch.ElapsedMilliseconds;
 				// stringtable / stringview 必须在使用前就绪。
 				// 原实现把它们丢进后台 Task.Run 后立刻返回成功，UI 一查名称就会拿到 null entries。
 				try
 				{
+					readStopwatch.Restart();
 					if (GetFile("stringtable.bin") != null)
 					{
 						base.Strtable.Loadstringtable(GetFile("stringtable.bin").Data, base.OverAllEncodingType, this);
@@ -304,6 +313,8 @@ public class PvfGroup : PvfPack
 						base.Strtable.InitDefault();
 						logger.Error(AppSetting.Instance.GetIlogger()?.GetStr("mess_StringTableNotFound"));
 					}
+					long stringTableMs = readStopwatch.ElapsedMilliseconds;
+					readStopwatch.Restart();
 					if (FileAny(AppSetting.Instance.PvfConfig.StringLstFileName))
 					{
 						base.Strview.InitStringData(GetFile(AppSetting.Instance.PvfConfig.StringLstFileName), this, base.OverAllEncodingType);
@@ -313,6 +324,8 @@ public class PvfGroup : PvfPack
 						base.Strview.InitDefault();
 						logger.Error(string.Format(AppSetting.Instance.GetIlogger()?.GetStr("mess_StringLstNotFound"), AppSetting.Instance.PvfConfig.StringLstFileName));
 					}
+					long stringViewMs = readStopwatch.ElapsedMilliseconds;
+					logger.Warning($"[读包细分] 文件表 {fileTableMs} ms，逐文件解密 {dataMs} ms，字符串表 {stringTableMs} ms，字符串链接 {stringViewMs} ms");
 				}
 				catch (Exception ex)
 				{
