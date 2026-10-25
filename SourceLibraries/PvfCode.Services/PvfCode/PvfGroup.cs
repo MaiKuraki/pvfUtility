@@ -368,12 +368,14 @@ public class PvfGroup : PvfPack
 		try
 		{
 			EncodingType current = base.OverAllEncodingType;
-			EncodingTypeDetector.Result result = EncodingTypeDetector.Detect(stringTableBytes, current);
-			// 每次都打印当前编码解出的样例：切错编码时用户一眼就能看出是乱码
-			if (result.Samples.Length > 0)
+			// 样例直接取已解析好的文本：stringtable 开头是文件路径，纯 ASCII 看不出编码对错，
+			// GetSampleTexts 会跳过它们挑含非 ASCII 的条目，且与实际显示完全一致。
+			string[] samples = base.Strtable.GetSampleTexts(3);
+			if (samples.Length > 0)
 			{
-				logger.Warning("[编码] 当前 " + current + "，样例：" + string.Join(" / ", result.Samples));
+				logger.Warning("[编码] 当前 " + current + "，样例：" + string.Join(" / ", samples));
 			}
+			EncodingTypeDetector.Result result = EncodingTypeDetector.Detect(stringTableBytes);
 			if (result.Suggested.HasValue && result.Suggested.Value != current)
 			{
 				logger.Warning($"[编码检测] 当前 {current} 解出的内容可能不是本包的正确编码，建议改用 {result.Suggested.Value}。位置：公共设置 → 默认编码");

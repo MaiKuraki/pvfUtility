@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -35,6 +35,9 @@ public class Stringtable
 
 	private List<StringTableEntry?> entries;
 
+	/// <summary>样例缓存：含非 ASCII 的条目，用于判断当前编码是否选错。</summary>
+	private string[] sampleTexts;
+
 	private Dictionary<PvfFileType, int> nameLabelByFileType;
 
 	public int NameLabel { get; private set; }
@@ -63,6 +66,7 @@ public class Stringtable
 		}
 		entriesByText = null;
 		entries = null;
+		sampleTexts = null;
 		if (entries != null)
 		{
 			entries.Clear();
@@ -176,6 +180,47 @@ public class Stringtable
 			return AppSetting.Instance.PvfConfig.FileTextTraditionalConvertSimplifiedAutoMethods(entries[tableId].Text);
 		}
 		return string.Format(AppSetting.Instance.GetIlogger()?.GetStr("mess_LocalStringTableDeleted"), tableId);
+	}
+
+	/// <summary>
+	/// 取几条"含非 ASCII 字符"的文本作为样例。
+	/// stringtable 开头大量是文件路径，纯 ASCII 看不出编码是否正确，
+	/// 所以直接跳过它们。这里用的是已经解析好的 Text，与界面显示完全一致。
+	/// </summary>
+	public string[] GetSampleTexts(int maxCount)
+	{
+		if (sampleTexts != null)
+		{
+			return sampleTexts;
+		}
+		List<string> result = new List<string>(maxCount);
+		if (entries != null)
+		{
+			for (int i = 0; i < entries.Count && result.Count < maxCount; i++)
+			{
+				string text = entries[i]?.Text;
+				if (string.IsNullOrEmpty(text))
+				{
+					continue;
+				}
+				bool hasNonAscii = false;
+				for (int k = 0; k < text.Length; k++)
+				{
+					if (text[k] >= '\u0080')
+					{
+						hasNonAscii = true;
+						break;
+					}
+				}
+				if (!hasNonAscii)
+				{
+					continue;
+				}
+				result.Add(text.Length > 24 ? text.Substring(0, 24) + "…" : text);
+			}
+		}
+		sampleTexts = result.ToArray();
+		return sampleTexts;
 	}
 
 	public int GetStringTableId(string str)

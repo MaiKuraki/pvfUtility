@@ -35,33 +35,30 @@ public static class EncodingTypeDetector
 		/// <summary>建议使用的编码；null 表示无法可靠判断。</summary>
 		public EncodingType? Suggested { get; init; }
 
-		/// <summary>当前配置编码解出的样例（最多 3 条），用于人工判断是否乱码。</summary>
-		public string[] Samples { get; init; }
 	}
 
-	public static Result Detect(byte[] stringTableBytes, EncodingType current)
+	public static Result Detect(byte[] stringTableBytes)
 	{
 		List<(int Start, int Length)> ranges = ExtractRanges(stringTableBytes, MaxDetectSamples);
-		string[] samples = BuildReadableSamples(stringTableBytes, current, ranges);
 		if (ranges.Count == 0)
 		{
-			return new Result { Suggested = null, Samples = samples };
+			return new Result { Suggested = null };
 		}
 
 		// 1) UTF-16LE：0x00 占比明显偏高
 		if (LooksLikeUtf16(stringTableBytes, ranges))
 		{
-			return new Result { Suggested = EncodingType.Unicode, Samples = samples };
+			return new Result { Suggested = EncodingType.Unicode };
 		}
 
 		// 2) UTF-8：严格解码全部通过，且样本里确实存在非 ASCII 字节
 		if (HasNonAsciiBytes(stringTableBytes, ranges) && IsStrictlyDecodable(stringTableBytes, ranges, new UTF8Encoding(false, true)))
 		{
-			return new Result { Suggested = EncodingType.UTF8, Samples = samples };
+			return new Result { Suggested = EncodingType.UTF8 };
 		}
 
 		// 3) 其余双字节编码只在"唯一一个能干净解码"时才给建议；简体/繁体通常都干净，返回 null
-		return new Result { Suggested = FindSingleCleanEncoding(stringTableBytes, ranges), Samples = samples };
+		return new Result { Suggested = FindSingleCleanEncoding(stringTableBytes, ranges) };
 	}
 
 	/// <summary>
@@ -130,44 +127,6 @@ public static class EncodingTypeDetector
 			return preferred;
 		}
 		return fallback;
-	}
-
-	private static string[] BuildReadableSamples(byte[] bytes, EncodingType encodingType, List<(int Start, int Length)> ranges)
-	{
-		if (ranges.Count == 0)
-		{
-			return Array.Empty<string>();
-		}
-		Encoding encoding;
-		try
-		{
-			encoding = Encoding.GetEncoding((int)encodingType, EncoderFallback.ReplacementFallback, new DecoderReplacementFallback("\uFFFD"));
-		}
-		catch
-		{
-			return Array.Empty<string>();
-		}
-		List<string> samples = new List<string>(3);
-		for (int i = 0; i < ranges.Count && samples.Count < 3; i++)
-		{
-			try
-			{
-				string text = encoding.GetString(bytes, ranges[i].Start, ranges[i].Length).Replace("\0", string.Empty).Trim();
-				if (text.Length == 0)
-				{
-					continue;
-				}
-				if (text.Length > 24)
-				{
-					text = text.Substring(0, 24) + "…";
-				}
-				samples.Add(text);
-			}
-			catch
-			{
-			}
-		}
-		return samples.ToArray();
 	}
 
 	private static bool HasNonAsciiBytes(byte[] bytes, List<(int Start, int Length)> ranges)
