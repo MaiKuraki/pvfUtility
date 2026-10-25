@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
@@ -603,6 +604,13 @@ public class AppSetting : ModelBase
 		}
 	}
 
+	/// <summary>上次成功写入配置文件的 JSON。用于跳过"内容没变"的重复写入。</summary>
+	private string lastSavedSettingJson;
+
+	private CancellationTokenSource saveSettingDebounceSource;
+
+	private readonly object saveSettingDebounceLock = new object();
+
 	public async Task SaveSetting()
 	{
 		try
@@ -610,11 +618,48 @@ public class AppSetting : ModelBase
 			_ = EditConfig.SizeUnitLabel.SelectedItem.DefaultValues;
 			OfflineDataStore.Save(this);
 			string contents = JsonConvert.SerializeObject(this, Formatting.Indented);
+			// 配置有 4.7MB，内容没变就不重写。一次开包流程里 SaveSetting 可能被调多次，
+			// 后半段内容通常已经相同，这一步能省掉整份重写。
+			if (string.Equals(contents, lastSavedSettingJson, StringComparison.Ordinal))
+			{
+				return;
+			}
 			await File.WriteAllTextAsync(GetConfigPath(), contents);
+			lastSavedSettingJson = contents;
 		}
 		catch (Exception)
 		{
 		}
+	}
+
+	/// <summary>
+	/// 合并短时间内的多次保存请求：只在最后一次变更后等待 delayMs 再写一次。
+	/// 适合"连续改多个设置项"的场景，避免每改一项就重写 4.7MB。
+	/// </summary>
+	public void RequestSaveSetting(int delayMs = 2000)
+	{
+		CancellationTokenSource source;
+		lock (saveSettingDebounceLock)
+		{
+			saveSettingDebounceSource?.Cancel();
+			saveSettingDebounceSource?.Dispose();
+			source = new CancellationTokenSource();
+			saveSettingDebounceSource = source;
+		}
+		_ = Task.Run(async delegate
+		{
+			try
+			{
+				await Task.Delay(delayMs, source.Token);
+				await SaveSetting();
+			}
+			catch (OperationCanceledException)
+			{
+			}
+			catch (Exception)
+			{
+			}
+		});
 	}
 
 	public Ilogger GetIlogger()

@@ -343,6 +343,30 @@ public class PvfGroup : PvfPack
 		}
 	}
 
+	/// <summary>
+	/// 内容指纹：文件数 + 每个文件的校验和与长度。
+	/// 用于判断"自上次自动备份以来是否有实际改动"，避免定时把没变的包整份重写。
+	/// 校验和本身已含文件名与内容，FNV-1a 聚合后碰撞概率可忽略。
+	/// 20 万文件约 2~3 ms，远低于一次几百 MB 的写入。
+	/// </summary>
+	public (int Count, ulong Hash) ComputeContentFingerprint()
+	{
+		if (base.FileList == null)
+		{
+			return (0, 0UL);
+		}
+		int count = 0;
+		ulong hash = 14695981039346656037UL;
+		foreach (KeyValuePair<string, PvfFile> item in base.FileList)
+		{
+			PvfFile file = item.Value;
+			count++;
+			hash = (hash ^ file.Checksum) * 1099511628211UL;
+			hash = (hash ^ (uint)file.DataLen) * 1099511628211UL;
+		}
+		return (count, hash);
+	}
+
 	public bool GetEquipmentpartsetInfo(PvfPack pvf, out Dictionary<int, Dictionary<string, EquipmentPartSet>> dic)
 	{
 		dic = new Dictionary<int, Dictionary<string, EquipmentPartSet>>();

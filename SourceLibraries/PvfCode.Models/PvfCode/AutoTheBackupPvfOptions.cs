@@ -47,7 +47,8 @@ public class AutoTheBackupPvfOptions : ViewModelBase
 		{
 			if (!f8p6nbkyP.HasValue)
 			{
-				f8p6nbkyP = 5;
+				// 默认 10 分钟：备份是整包重写，间隔太短会白白消耗 SSD 写入寿命
+				f8p6nbkyP = 10;
 			}
 			if (f8p6nbkyP <= 0)
 			{
