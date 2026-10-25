@@ -599,6 +599,8 @@ public sealed class PvfPreviewDocument : DocumentBase
 		RaisePropertyChanged(nameof(SourcePath));
 		RaisePropertyChanged(nameof(FileName));
 		RaisePropertyChanged(nameof(IsAniPreview));
+		// 切换文档才需要让图标缓存失效（不同文件引用不同图标）
+		referenceIconCache.Clear();
 		RefreshPreview();
 	}
 
@@ -609,7 +611,9 @@ public sealed class PvfPreviewDocument : DocumentBase
 		{
 			return;
 		}
-		referenceIconCache.Clear();
+		// 注意：这里不清 referenceIconCache。
+		// 图标只取决于 PvfFile 本身，与编辑器里尚未保存的文本无关；
+		// 原来每次文本变更都全清，导致每敲一个字就重新解析一遍所有引用图标。
 		ParseTags(sourceTextDocument?.Text ?? string.Empty);
 		RichPreview = BuildRichPreview(sourceDocument.File);
 		if (IsAniPreview)
@@ -639,48 +643,74 @@ public sealed class PvfPreviewDocument : DocumentBase
 		tagsByName.Clear();
 		PvfPreviewTag current = null;
 		int offset = 0;
-		string[] lines = Regex.Split(text, "(?<=\\n)");
-		foreach (string rawWithEnding in lines)
+		int length = text.Length;
+		while (offset < length)
 		{
-			string rawLine = rawWithEnding.TrimEnd('\r', '\n');
-			string trimmed = rawLine.Trim();
-			Match match = TagLineRegex.Match(rawLine);
-			if (match.Success)
+			// 手写切行：原来用 Regex.Split("(?<=\\n)") 保留行尾，
+			// 每敲一个字都要跑一遍正则引擎并分配一个行数组。
+			int lineEnd = text.IndexOf('\n', offset);
+			int nextOffset;
+			int rawEnd;
+			if (lineEnd < 0)
 			{
-				if (match.Groups["close"].Success)
+				nextOffset = length;
+				rawEnd = length;
+			}
+			else
+			{
+				nextOffset = lineEnd + 1;
+				rawEnd = lineEnd;
+			}
+			if (rawEnd > offset && text[rawEnd - 1] == '\r')
+			{
+				rawEnd--;
+			}
+			string rawLine = text.Substring(offset, rawEnd - offset);
+			string trimmed = rawLine.Trim();
+			// 标签行必然含 '['（正则以 ^\s*\[ 开头）。先做廉价过滤，
+			// 让绝大多数数据行不进入正则引擎。
+			if (rawLine.IndexOf('[') >= 0)
+			{
+				Match match = TagLineRegex.Match(rawLine);
+				if (match.Success)
 				{
-					current = null;
-					offset += rawWithEnding.Length;
+					if (match.Groups["close"].Success)
+					{
+						current = null;
+						offset = nextOffset;
+						continue;
+					}
+					string name = match.Groups["name"].Value.Trim().ToLowerInvariant();
+					Group nameGroup = match.Groups["name"];
+					PvfPreviewTag occurrence = new(name, GetLineNumber(offset), offset + nameGroup.Index, nameGroup.Length);
+					Tags.Add(occurrence);
+					if (!tagsByName.TryGetValue(name, out List<PvfPreviewTag> occurrences))
+					{
+						occurrences = new List<PvfPreviewTag>();
+						tagsByName[name] = occurrences;
+					}
+					occurrences.Add(occurrence);
+					bool isTopLevel = match.Groups["indent"].Length == 0;
+					if (current != null && ShouldKeepTagLineInCurrent(current.Name, name, isTopLevel))
+					{
+						current.AddValue(trimmed);
+					}
+					else
+					{
+						current = occurrence;
+						current.AddValue(match.Groups["value"].Value);
+					}
+					offset = nextOffset;
 					continue;
 				}
-				string name = match.Groups["name"].Value.Trim().ToLowerInvariant();
-				Group nameGroup = match.Groups["name"];
-				PvfPreviewTag occurrence = new(name, GetLineNumber(offset), offset + nameGroup.Index, nameGroup.Length);
-				Tags.Add(occurrence);
-				if (!tagsByName.TryGetValue(name, out List<PvfPreviewTag> occurrences))
-				{
-					occurrences = new List<PvfPreviewTag>();
-					tagsByName[name] = occurrences;
-				}
-				occurrences.Add(occurrence);
-				bool isTopLevel = match.Groups["indent"].Length == 0;
-				if (current != null && ShouldKeepTagLineInCurrent(current.Name, name, isTopLevel))
-				{
-					current.AddValue(trimmed);
-				}
-				else
-				{
-					current = occurrence;
-					current.AddValue(match.Groups["value"].Value);
-				}
 			}
-			else if (current != null && trimmed.Length > 0 && !trimmed.StartsWith("//", StringComparison.Ordinal))
+			if (current != null && trimmed.Length > 0 && !trimmed.StartsWith("//", StringComparison.Ordinal))
 			{
 				current.AddValue(trimmed);
 			}
-			offset += rawWithEnding.Length;
+			offset = nextOffset;
 		}
-		SelectedTag = Tags.FirstOrDefault();
+		SelectedTag = Tags.Count > 0 ? Tags[0] : null;
 	}
 
 	private int GetLineNumber(int offset)
@@ -1483,9 +1513,28 @@ public sealed class PvfPreviewDocument : DocumentBase
 		bool inBlockComment = false;
 		int lineNumber = 1;
 		int lineStartOffset = 0;
-		foreach (string rawWithEnding in Regex.Split(text, "(?<=\\n)"))
+		int textLength = text.Length;
+		while (lineStartOffset < textLength)
 		{
-			string rawLine = rawWithEnding.TrimEnd('\r', '\n');
+			// 手写切行，避免每次刷新都跑一遍 Regex.Split 并分配行数组
+			int lineEnd = text.IndexOf('\n', lineStartOffset);
+			int nextOffset;
+			int rawEnd;
+			if (lineEnd < 0)
+			{
+				nextOffset = textLength;
+				rawEnd = textLength;
+			}
+			else
+			{
+				nextOffset = lineEnd + 1;
+				rawEnd = lineEnd;
+			}
+			if (rawEnd > lineStartOffset && text[rawEnd - 1] == '\r')
+			{
+				rawEnd--;
+			}
+			string rawLine = text.Substring(lineStartOffset, rawEnd - lineStartOffset);
 			string lineText = RemoveBlockComments(rawLine, ref inBlockComment);
 			string trimmed = StripLineComment(lineText).Trim();
 			if (trimmed.Length > 0)
@@ -1530,7 +1579,7 @@ public sealed class PvfPreviewDocument : DocumentBase
 					AppendSkillDataLine(GetScene(sceneStack[^1]), currentBlock, trimmed, lineStartOffset + Math.Max(0, lineText.IndexOf(trimmed, StringComparison.Ordinal)), lineNumber);
 				}
 			}
-			lineStartOffset += rawWithEnding.Length;
+			lineStartOffset = nextOffset;
 			lineNumber++;
 		}
 		return scenes.Values.Where(scene => scene.LevelInfo.Count > 0 || scene.StaticData.Count > 0).ToList();
@@ -2427,7 +2476,12 @@ public sealed class PvfPreviewDocument : DocumentBase
 		Application.Current.Dispatcher.BeginInvoke((Action)RefreshPreview, DispatcherPriority.Background);
 	}
 
-	private void OnSourcePreviewContentChanged(object sender, EventArgs e) => RefreshPreview();
+	private void OnSourcePreviewContentChanged(object sender, EventArgs e)
+	{
+		// 已保存内容变化 → 引用图标可能失效，重新解析
+		referenceIconCache.Clear();
+		RefreshPreview();
+	}
 
 	private void UnsubscribeSource()
 	{
