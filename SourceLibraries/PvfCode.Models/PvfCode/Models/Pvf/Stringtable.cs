@@ -75,8 +75,14 @@ public class Stringtable
 	{
 		NameLableOrSetNameLable = new HashSet<int>();
 		this.encoding = encoding;
-		entries = new List<StringTableEntry>();
-		entriesByText = new Dictionary<string, StringTableEntry>();
+		// 条目数已知，预设容量避免几十万条时多次扩容与整表 rehash
+		int declaredCount = stBytes != null && stBytes.Length >= 4 ? BitConverter.ToInt32(stBytes, 0) : 0;
+		if (declaredCount < 0)
+		{
+			declaredCount = 0;
+		}
+		entries = new List<StringTableEntry>(declaredCount);
+		entriesByText = new Dictionary<string, StringTableEntry>(declaredCount);
 		if (stBytes == null)
 		{
 			AppSetting.Instance.GetIlogger()?.Error("stringtable.bin文件 是Null");

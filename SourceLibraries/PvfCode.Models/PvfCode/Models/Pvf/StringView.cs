@@ -89,13 +89,15 @@ public class StringView
 			return;
 		}
 		int dataLen = file.DataLen;
-		stringListFiles = new StrListFile[(dataLen - 2) / 10];
-		PooledDictionary<string, int> pooledDictionary = new PooledDictionary<string, int>();
+		int entryCount = (dataLen - 2) / 10;
+		stringListFiles = new StrListFile[entryCount];
+		// 条目数已知，预设容量；原来不预设，几万条会反复扩容
+		PooledDictionary<string, int> pooledDictionary = new PooledDictionary<string, int>(entryCount);
 		int num = 0;
 		for (int i = 2; i < dataLen; i += 10)
 		{
 			string stringItem = pvf.Strtable.GetStringItem(BitConverter.ToInt32(file.Data, i + 1 + 5));
-			if (pooledDictionary.ContainsKey(stringItem))
+			if (pooledDictionary.TryGetValue(stringItem, out _))
 			{
 				AppSetting.Instance.GetIlogger()?.Error("n_string.lst 文件中存在重复的kor.str文件名:" + stringItem);
 			}
@@ -105,14 +107,21 @@ public class StringView
 			}
 			num++;
 		}
+		// 编码器只取一次：原来在循环里每条都调 Encoding.GetEncoding（带锁的全局查表）
+		System.Text.Encoding textEncoding = Encoding.GetEncoding((int)type);
 		foreach (KeyValuePair<string, int> item in pooledDictionary)
 		{
 			string text = string.Empty;
-			if (pvf.FileList.TryGetValue(item.Key.ToLower(), out PvfFile value))
+			// 先按原样查，失败再降级小写：PVF 文件名绝大多数已是小写，能省掉每条一次 ToLower 分配
+			if (!pvf.FileList.TryGetValue(item.Key, out PvfFile value))
+			{
+				pvf.FileList.TryGetValue(item.Key.ToLower(), out value);
+			}
+			if (value != null)
 			{
 				if (value.Data != null)
 				{
-					text = Encoding.GetEncoding((int)type).GetString(value.Data).TrimEnd(new char[1]);
+					text = textEncoding.GetString(value.Data).TrimEnd(new char[1]);
 				}
 			}
 			else
