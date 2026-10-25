@@ -11,21 +11,22 @@ namespace PvfCode.Models.Pvf;
 /// 设计原则：只判断"能可靠判断的"，判断不了就老实说不知道，并给出解码样例让用户自己看。
 ///
 /// 可靠判断：
-/// - UTF-8：字节结构严格（首字节 0xC0-0xF7 + 续字节 0x80-0xBF），GBK/Big5 文本几乎不可能全部通过校验
-/// - UTF-16：ASCII 字符的高字节为 0，字节流里 0x00 的比例明显偏高
+/// - UTF-16LE：ASCII 字符的高字节为 0，字节流里 0x00 比例明显偏高（必须先于 UTF-8 判断，
+///   因为 UTF-16 的字节流如 "U\0n\0" 同时也是一串合法 UTF-8）
+/// - UTF-8：字节结构严格，严格解码全部通过且样本含非 ASCII 字节
 ///
-/// 不可靠、因此**不做**判断：
-/// - 简体(936) 与 繁体(950)：双字节范围高度重叠，用错编码照样解出合法汉字，
-///   纯统计无法区分。强行猜只会把用户带进沟里。
+/// 不做判断：
+/// - 简体(936) 与 繁体(950)：双字节范围高度重叠，用错编码照样解出合法汉字，纯统计无法区分。
 ///
-/// 因此本类返回的 suggested 可能为 null（表示无法判断），由调用方输出样例文本供人工确认。
+/// 采样策略：stringtable 开头大量是文件路径（纯 ASCII），任何编码解出来都一样，
+/// 所以取样时**优先挑含 >=0x80 字节的条目**，否则样例和检测都看不出问题。
 /// </summary>
 public static class EncodingTypeDetector
 {
-	private const int MaxSamples = 120;
+	private const int MaxDetectSamples = 120;
 
-	/// <summary>样例扫描范围：路径都在前面，中文条目可能在很后面，需要放宽。</summary>
-	private const int SampleScanLimit = 3000;
+	private const int MaxScanEntries = 300000;
+
 	private const int MaxSampleBytes = 96;
 
 	/// <summary>探测结果。</summary>
@@ -36,52 +37,103 @@ public static class EncodingTypeDetector
 
 		/// <summary>当前配置编码解出的样例（最多 3 条），用于人工判断是否乱码。</summary>
 		public string[] Samples { get; init; }
-
-		/// <summary>是否明确指向 UTF-8 / Unicode 这类结构性编码。</summary>
-		public bool Structural { get; init; }
 	}
 
 	public static Result Detect(byte[] stringTableBytes, EncodingType current)
 	{
-		string[] samples = BuildReadableSamples(stringTableBytes, current);
-		if (stringTableBytes == null || stringTableBytes.Length < 16)
-		{
-			return new Result { Suggested = null, Samples = samples, Structural = false };
-		}
-		List<(int Start, int Length)> ranges = ExtractRanges(stringTableBytes);
+		List<(int Start, int Length)> ranges = ExtractRanges(stringTableBytes, MaxDetectSamples);
+		string[] samples = BuildReadableSamples(stringTableBytes, current, ranges);
 		if (ranges.Count == 0)
 		{
-			return new Result { Suggested = null, Samples = samples, Structural = false };
+			return new Result { Suggested = null, Samples = samples };
 		}
 
-		// 1) UTF-16LE：ASCII 在 UTF-16 里高字节为 0，样本中 0x00 占比会明显偏高。
-		//    必须先判这个：UTF-16 的字节流（如 "U\0n\0"）同时也是一串合法 UTF-8，会被下一步误判。
+		// 1) UTF-16LE：0x00 占比明显偏高
 		if (LooksLikeUtf16(stringTableBytes, ranges))
 		{
-			return new Result { Suggested = EncodingType.Unicode, Samples = samples, Structural = true };
+			return new Result { Suggested = EncodingType.Unicode, Samples = samples };
 		}
 
-		// 2) UTF-8：严格解码全部通过，且样本里存在非 ASCII 字节，才认为是 UTF-8。
-		//    纯 ASCII 的样本对所有编码都合法，不能作为判据。
+		// 2) UTF-8：严格解码全部通过，且样本里确实存在非 ASCII 字节
 		if (HasNonAsciiBytes(stringTableBytes, ranges) && IsStrictlyDecodable(stringTableBytes, ranges, new UTF8Encoding(false, true)))
 		{
-			return new Result { Suggested = EncodingType.UTF8, Samples = samples, Structural = true };
+			return new Result { Suggested = EncodingType.UTF8, Samples = samples };
 		}
 
-		// 3) 其余双字节编码：只有"某个编码完全无解码失败、而其他编码有失败"时才给建议。
-		//    简体/繁体通常都无失败，此时返回 null，交给用户看样例判断。
-		EncodingType? onlyClean = FindSingleCleanEncoding(stringTableBytes, ranges);
-		return new Result { Suggested = onlyClean, Samples = samples, Structural = false };
+		// 3) 其余双字节编码只在"唯一一个能干净解码"时才给建议；简体/繁体通常都干净，返回 null
+		return new Result { Suggested = FindSingleCleanEncoding(stringTableBytes, ranges), Samples = samples };
 	}
 
 	/// <summary>
-	/// 用指定编码解出几条字符串，供人工判断是否乱码。
-	/// 优先挑"含非 ASCII 字符"的条目：stringtable 开头往往是文件路径（纯 ASCII），
-	/// 任何编码都能正确解码，拿它们当样例看不出问题。
+	/// 取样：优先收集含高位字节（中文/韩文/日文）的条目，不够再补 ASCII 条目。
+	/// 只取前若干条会全部落在文件路径上，对判断编码毫无帮助。
 	/// </summary>
-	private static string[] BuildReadableSamples(byte[] bytes, EncodingType encodingType)
+	private static List<(int Start, int Length)> ExtractRanges(byte[] bytes, int maxCount)
 	{
-		List<(int Start, int Length)> ranges = ExtractRanges(bytes, SampleScanLimit);
+		List<(int Start, int Length)> preferred = new List<(int, int)>(maxCount);
+		List<(int Start, int Length)> fallback = new List<(int, int)>(maxCount);
+		if (bytes == null || bytes.Length < 8)
+		{
+			return preferred;
+		}
+		int count = BitConverter.ToInt32(bytes, 0);
+		if (count <= 0)
+		{
+			return preferred;
+		}
+		int limit = Math.Min(count, MaxScanEntries);
+		for (int i = 0; i < limit; i++)
+		{
+			int indexOffset = i * 4 + 4;
+			if (indexOffset + 8 > bytes.Length)
+			{
+				break;
+			}
+			int rawStart = BitConverter.ToInt32(bytes, indexOffset);
+			int end = BitConverter.ToInt32(bytes, indexOffset + 4);
+			// offsets[i] 指向 4 字节长度字段，数据在其后；跨度里含这 4 字节，要减掉，
+			// 否则会读到下一条的长度字段，末尾那条还会因越界被跳过。
+			int length = end - rawStart - 4;
+			int dataStart = rawStart + 4;
+			if (length <= 0 || dataStart < 0 || dataStart + length > bytes.Length)
+			{
+				continue;
+			}
+			if (length > MaxSampleBytes)
+			{
+				length = MaxSampleBytes;
+			}
+			bool hasHighByte = false;
+			for (int p = dataStart; p < dataStart + length; p++)
+			{
+				if (bytes[p] >= 0x80)
+				{
+					hasHighByte = true;
+					break;
+				}
+			}
+			if (hasHighByte)
+			{
+				preferred.Add((dataStart, length));
+				if (preferred.Count >= maxCount)
+				{
+					break;
+				}
+			}
+			else if (fallback.Count < maxCount)
+			{
+				fallback.Add((dataStart, length));
+			}
+		}
+		if (preferred.Count > 0)
+		{
+			return preferred;
+		}
+		return fallback;
+	}
+
+	private static string[] BuildReadableSamples(byte[] bytes, EncodingType encodingType, List<(int Start, int Length)> ranges)
+	{
 		if (ranges.Count == 0)
 		{
 			return Array.Empty<string>();
@@ -95,90 +147,27 @@ public static class EncodingTypeDetector
 		{
 			return Array.Empty<string>();
 		}
-		List<string> withNonAscii = new List<string>(3);
-		List<string> fallback = new List<string>(3);
-		for (int i = 0; i < ranges.Count; i++)
+		List<string> samples = new List<string>(3);
+		for (int i = 0; i < ranges.Count && samples.Count < 3; i++)
 		{
-			string text;
 			try
 			{
-				text = encoding.GetString(bytes, ranges[i].Start, ranges[i].Length).Replace("\0", string.Empty).Trim();
+				string text = encoding.GetString(bytes, ranges[i].Start, ranges[i].Length).Replace("\0", string.Empty).Trim();
+				if (text.Length == 0)
+				{
+					continue;
+				}
+				if (text.Length > 24)
+				{
+					text = text.Substring(0, 24) + "…";
+				}
+				samples.Add(text);
 			}
 			catch
 			{
-				continue;
-			}
-			if (text.Length == 0)
-			{
-				continue;
-			}
-			if (text.Length > 24)
-			{
-				text = text.Substring(0, 24) + "…";
-			}
-			bool hasNonAscii = false;
-			for (int k = 0; k < text.Length; k++)
-			{
-				if (text[k] >= '\u0080')
-				{
-					hasNonAscii = true;
-					break;
-				}
-			}
-			if (hasNonAscii)
-			{
-				withNonAscii.Add(text);
-				if (withNonAscii.Count >= 3)
-				{
-					break;
-				}
-			}
-			else if (fallback.Count < 3)
-			{
-				fallback.Add(text);
 			}
 		}
-		if (withNonAscii.Count > 0)
-		{
-			return withNonAscii.ToArray();
-		}
-		return fallback.ToArray();
-	}
-
-	private static List<(int Start, int Length)> ExtractRanges(byte[] bytes, int maxCount = MaxSamples)
-	{
-		List<(int, int)> ranges = new List<(int, int)>(Math.Min(maxCount, 256));
-		if (bytes == null || bytes.Length < 8)
-		{
-			return ranges;
-		}
-		int count = BitConverter.ToInt32(bytes, 0);
-		if (count <= 0)
-		{
-			return ranges;
-		}
-		int limit = Math.Min(count, maxCount);
-		for (int i = 0; i < limit; i++)
-		{
-			int indexOffset = i * 4 + 4;
-			if (indexOffset + 8 > bytes.Length)
-			{
-				break;
-			}
-			int start = BitConverter.ToInt32(bytes, indexOffset);
-			int end = BitConverter.ToInt32(bytes, indexOffset + 4);
-			int length = end - start;
-			if (length <= 0 || start < 0 || start + 4 + length > bytes.Length)
-			{
-				continue;
-			}
-			if (length > MaxSampleBytes)
-			{
-				length = MaxSampleBytes;
-			}
-			ranges.Add((start + 4, length));
-		}
-		return ranges;
+		return samples.ToArray();
 	}
 
 	private static bool HasNonAsciiBytes(byte[] bytes, List<(int Start, int Length)> ranges)
@@ -233,14 +222,9 @@ public static class EncodingTypeDetector
 				}
 			}
 		}
-		// 纯 ASCII 的 UTF-16 文本，约一半字节是 0；中文 UTF-16 也会有大量 0 出现在高字节
 		return total > 0 && zeroCount * 100 / total >= 25;
 	}
 
-	/// <summary>
-	/// 找出"唯一一个能干净解码"的双字节编码。
-	/// 简体/繁体通常都干净，此时返回 null（不猜）。
-	/// </summary>
 	private static EncodingType? FindSingleCleanEncoding(byte[] bytes, List<(int Start, int Length)> ranges)
 	{
 		EncodingType[] candidates = new EncodingType[4]
